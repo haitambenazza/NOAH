@@ -10,7 +10,7 @@ gpiozero>=2.0.1
 lgpio>=0.2.2.0
 rpi-lgpio>=0.6
 picamera2>=0.3.36
-av<13
+av>=13
 
 # --- Core Audio & Signal Processing (Required by main.py) ---
 sounddevice>=0.4.6
