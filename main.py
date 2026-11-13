@@ -729,12 +729,12 @@ class BotGUI:
         self.oww_model = None
         if OWW_AVAILABLE and os.path.exists(WAKE_WORD_MODEL):
             try:
-                self.oww_model = Model(wakeword_model_paths=[WAKE_WORD_MODEL])
-                print("[INIT] Wake Word Loaded.", flush=True)
+                self.oww_model = Model(wakeword_models=[WAKE_WORD_MODEL], inference_framework="onnx")
+                print("[INIT] Wake Word Loaded (ONNX).", flush=True)
             except TypeError:
                 try:
-                    self.oww_model = Model(wakeword_models=[WAKE_WORD_MODEL])
-                    print("[INIT] Wake Word Loaded (New API).", flush=True)
+                    self.oww_model = Model(wakeword_model_paths=[WAKE_WORD_MODEL])
+                    print("[INIT] Wake Word Loaded (Legacy API).", flush=True)
                 except Exception as e:
                     print(f"[CRITICAL] Failed to load wake word model: {e}")
             except Exception as e:
