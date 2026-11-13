@@ -58,6 +58,7 @@ except ImportError:
     print("[INIT WARNING] duckduckgo-search not installed — Web search action will be disabled.")
 
 # --- COMPUTER VISION ---
+os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
 try:
     import cv2
     CV2_AVAILABLE = True
@@ -66,12 +67,17 @@ except ImportError:
     print("[INIT WARNING] opencv-python not installed — Camera & Face Detection disabled.")
 
 # --- RASPBERRY PI HARDWARE ---
+# Ensure system apt packages (libcamera / picamera2 / lgpio) are visible even inside a virtualenv
+_SYS_DIST_PACKAGES = "/usr/lib/python3/dist-packages"
+if os.path.isdir(_SYS_DIST_PACKAGES) and _SYS_DIST_PACKAGES not in sys.path:
+    sys.path.append(_SYS_DIST_PACKAGES)
+
 try:
     from picamera2 import Picamera2
     PICAMERA_AVAILABLE = True
-except ImportError:
+except Exception as _picam_err:
     PICAMERA_AVAILABLE = False
-    print("[INIT INFO] picamera2 not installed — Will fall back to OpenCV VideoCapture.")
+    print(f"[INIT INFO] picamera2 unavailable ({_picam_err}) — Will fall back to OpenCV VideoCapture.")
 
 try:
     from gpiozero import Servo
@@ -519,44 +525,77 @@ class CameraPipeline:
             self.thread.join(timeout=2.0)
         self._cleanup_camera()
 
+    def _get_v4l2_capture_indices(self):
+        """Returns candidate /dev/videoN indices, filtering out Raspberry Pi ISP/codec metadata nodes."""
+        v4l_dir = "/sys/class/video4linux"
+        skip_keywords = ("pispbe", "rpi-hevc", "bcm2835-isp", "bcm2835-codec")
+        preferred = []
+        fallback = []
+        if os.path.isdir(v4l_dir):
+            for entry in sorted(os.listdir(v4l_dir)):
+                if not entry.startswith("video") or not entry[5:].isdigit():
+                    continue
+                idx = int(entry[5:])
+                name_file = os.path.join(v4l_dir, entry, "name")
+                dev_name = ""
+                if os.path.exists(name_file):
+                    try:
+                        with open(name_file, "r") as f:
+                            dev_name = f.read().strip().lower()
+                    except Exception:
+                        pass
+                if any(kw in dev_name for kw in skip_keywords):
+                    continue
+                if "rp1-cfe" in dev_name:
+                    fallback.append(idx)
+                else:
+                    preferred.append(idx)
+            candidates = preferred + fallback
+            if candidates:
+                return candidates
+        return [0, 1, 2, 4, 6, 8]
+
     def _init_camera(self):
         # 1. Try Picamera2 first (Native Raspberry Pi CSI camera)
         if PICAMERA_AVAILABLE:
             try:
-                self.picam = Picamera2()
-                config = self.picam.create_preview_configuration(
-                    main={"size": (1640, 1232), "format": "BGR888"}
-                )
-                self.picam.configure(config)
-                self.picam.start()
-                print(f"[CAMERA] Initialized Picamera2 (1640x1232 binned at {self.fps} FPS).", flush=True)
-                return True
+                cam_info = Picamera2.global_camera_info()
+                if cam_info:
+                    self.picam = Picamera2()
+                    config = self.picam.create_preview_configuration(
+                        main={"size": (1640, 1232), "format": "BGR888"}
+                    )
+                    self.picam.configure(config)
+                    self.picam.start()
+                    print(f"[CAMERA] Initialized Picamera2 (1640x1232 binned at {self.fps} FPS).", flush=True)
+                    return True
+                else:
+                    print("[CAMERA INFO] Picamera2 found 0 CSI cameras connected. Falling back to OpenCV.", flush=True)
             except Exception as e:
                 print(f"[CAMERA INFO] Picamera2 startup failed: {e}. Falling back to OpenCV.", flush=True)
                 self.picam = None
 
-        # 2. Try OpenCV (USB / Mock cameras)
+        # 2. Try OpenCV (USB / V4L2 cameras) using explicit V4L2 backend to avoid obsensor errors
         if CV2_AVAILABLE:
-            for idx in (0, 1, 2):
+            backend = getattr(cv2, "CAP_V4L2", cv2.CAP_ANY)
+            for idx in self._get_v4l2_capture_indices():
                 try:
-                    cap = cv2.VideoCapture(idx)
+                    cap = cv2.VideoCapture(idx, backend)
                     if cap.isOpened():
                         # Perform a test read to ensure this is a valid video stream node
-                        # (skipping metadata device nodes on Linux/Pi)
                         ret, test_frame = cap.read()
                         if ret and test_frame is not None:
                             self.cap = cap
                             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
                             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-                            print(f"[CAMERA] Initialized OpenCV VideoCapture on index {idx} ({self.width}x{self.height}).", flush=True)
+                            print(f"[CAMERA] Initialized OpenCV VideoCapture on /dev/video{idx} ({self.width}x{self.height}).", flush=True)
                             return True
                         else:
-                            print(f"[CAMERA INFO] OpenCV index {idx} opened but failed to read test frame (metadata or busy).", flush=True)
                             cap.release()
                 except Exception as ex:
                     print(f"[CAMERA INFO] Failed opening camera index {idx}: {ex}", flush=True)
         
-        print("[CAMERA ERROR] No camera backends available.", flush=True)
+        print("[CAMERA INFO] No active CSI or USB camera detected — continuing without camera.", flush=True)
         return False
 
     def _cleanup_camera(self):
