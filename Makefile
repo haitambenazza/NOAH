@@ -1,5 +1,6 @@
 build:
-	./setup.sh
+	sudo chmod +x ./setup.sh
+	sudo ./setup.sh
 	pip3 install -r requirements.txt
 	pip3 install --no-deps "openwakeword>=0.6.0"
 
