@@ -1,33 +1,27 @@
 # =========================================================================
-# Be More Agent (BMO) — Python Dependencies (Raspberry Pi 4)
-#
-# System prerequisites on Raspberry Pi OS (Debian/Bookworm):
-#   sudo apt update && sudo apt install -y \
-#       python3-tk python3-pil.imagetk libportaudio2 \
-#       python3-picamera2 python3-lgpio
+# Be More Agent (BMO) — Necessary Dependencies for main.py (Raspberry Pi 4)
+# Filtered from old.txt + required runtime imports in main.py
 # =========================================================================
 
-# --- Core GUI, Audio & Numerical ---
-Pillow>=10.0.0
-numpy>=1.24.0,<2.0.0
-scipy>=1.10.0
-sounddevice>=0.4.6
+# --- Necessary Packages from old.txt (Raspberry Pi 4 Base & Hardware) ---
+pillow>=11.1.0
+numpy>=2.2.4
+gpiozero>=2.0.1
+lgpio>=0.2.2.0
+rpi-lgpio>=0.6
+picamera2>=0.3.36
+av>=14.2.0
 
-# --- LLM & AI Engines ---
+# --- Core Audio & Signal Processing (Required by main.py) ---
+sounddevice>=0.4.6
+scipy>=1.10.0
+
+# --- AI, Wake Word & Speech-to-Text (Required by main.py) ---
 ollama>=0.3.0
 openwakeword>=0.6.0
 onnxruntime>=1.16.0
 faster-whisper>=1.0.0
 
-# --- Web Search ---
+# --- Web Search & Computer Vision (Required by main.py) ---
 duckduckgo-search>=6.0.0
-
-# --- Computer Vision ---
 opencv-python>=4.8.0
-
-# --- Raspberry Pi Hardware Control ---
-gpiozero>=2.0.1
-lgpio>=0.2.2.0
-
-# --- Raspberry Pi CSI Camera (Provided by apt package python3-picamera2) ---
-# picamera2>=0.3.12
