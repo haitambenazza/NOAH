@@ -142,6 +142,16 @@ def load_config():
             print(f"Config Error: {e}. Using defaults.")
     return config
 
+def _highpass_filter(samples_float32, samplerate, cutoff_hz=150.0):
+    """Removes low-frequency fan/USB rumble (<150 Hz) before VAD and Whisper."""
+    if len(samples_float32) < 16 or samplerate <= cutoff_hz * 2:
+        return samples_float32
+    try:
+        sos = scipy.signal.butter(2, cutoff_hz, btype="highpass", fs=samplerate, output="sos")
+        return scipy.signal.sosfiltfilt(sos, samples_float32).astype(np.float32)
+    except Exception:
+        return samples_float32
+
 class HailoOllamaClient:
     """Minimal REST client compatible with hailo-ollama (Oat++ v1.4.0) and standard Ollama."""
 
@@ -170,8 +180,13 @@ class HailoOllamaClient:
         clean_messages = [
             {"role": str(m.get("role", "user")), "content": str(m.get("content", ""))}
             for m in messages
-            if m.get("content") is not None
+            if m.get("content") is not None and str(m.get("content", "")).strip() != ""
         ]
+        if len(clean_messages) > 7 and clean_messages[0]["role"] == "system":
+            clean_messages = [clean_messages[0]] + clean_messages[-6:]
+        elif len(clean_messages) > 6 and (not clean_messages or clean_messages[0]["role"] != "system"):
+            clean_messages = clean_messages[-6:]
+
         payload = {
             "model": str(model),
             "messages": clean_messages,
@@ -184,7 +199,7 @@ class HailoOllamaClient:
         if stream:
             def _iter_chunks():
                 try:
-                    for line in resp.iter_lines(decode_unicode=True):
+                    for line in resp.iter_lines(chunk_size=1, decode_unicode=True):
                         if not line:
                             continue
                         if isinstance(line, bytes):
@@ -192,7 +207,14 @@ class HailoOllamaClient:
                         line = line.strip()
                         if not line:
                             continue
-                        yield json.loads(line)
+                        if line.startswith("data:"):
+                            line = line[5:].strip()
+                            if not line or line == "[DONE]":
+                                continue
+                        try:
+                            yield json.loads(line)
+                        except json.JSONDecodeError as je:
+                            print(f"[LLM WARNING] Non-JSON stream line ({je}): {line[:120]!r}", flush=True)
                 finally:
                     resp.close()
 
@@ -1395,13 +1417,13 @@ class BotGUI:
                 self.append_to_text(f"YOU: {user_text}")
                 self.interrupted.clear()
                 self.idle_event.clear()
-                self.chat_and_respond(user_text)
+                replied = self.chat_and_respond(user_text)
 
                 if self.exiting or self.stop_event.is_set():
                     break
 
-                # Restart listening trigger unless idle commanded
-                if not self.idle_event.is_set() and not self.exiting and not self.stop_event.is_set():
+                # Restart listening trigger unless idle commanded or reply failed
+                if replied and not self.idle_event.is_set() and not self.exiting and not self.stop_event.is_set():
                     print("[AUTO] Listening active again...", flush=True)
                     self._cancel_auto_stop_timer()
                     self.ptt_auto_stop_duration = 5.0
@@ -1645,27 +1667,40 @@ class BotGUI:
         buffer = []
         calib_rms = []
         noise_floor = 0.008
-        speech_threshold = 0.018
-        silence_threshold = 0.0135
+        speech_threshold = 0.025
+        silence_threshold = 0.016
         speech_detected = False
         last_speech_time = None
         peak_rms = 0.0
 
+        try:
+            sos = scipy.signal.butter(2, 150.0, btype="highpass", fs=samplerate, output="sos")
+            zi = scipy.signal.sosfilt_zi(sos) * 0.0
+        except Exception:
+            sos = None
+            zi = None
+
         def callback(indata, frames, time_info, status):
-            nonlocal noise_floor, speech_threshold, silence_threshold, speech_detected, last_speech_time, peak_rms
+            nonlocal noise_floor, speech_threshold, silence_threshold, speech_detected, last_speech_time, peak_rms, zi
             buffer.append(indata.copy())
             chunk_f = indata.astype(np.float32).flatten() / 32768.0
-            rms = float(np.sqrt(np.mean(chunk_f * chunk_f))) if chunk_f.size > 0 else 0.0
+            if sos is not None and chunk_f.size > 0:
+                chunk_hp, zi = scipy.signal.sosfilt(sos, chunk_f, zi=zi)
+            elif chunk_f.size > 0:
+                chunk_hp = chunk_f - float(np.mean(chunk_f))
+            else:
+                chunk_hp = chunk_f
+            rms = float(np.sqrt(np.mean(chunk_hp * chunk_hp))) if chunk_hp.size > 0 else 0.0
             if rms > peak_rms:
                 peak_rms = rms
 
             if len(calib_rms) < calib_chunks_needed:
                 calib_rms.append(rms)
                 if len(calib_rms) == calib_chunks_needed:
-                    noise_floor = min(float(np.percentile(calib_rms, 25)), 0.035)
-                    speech_threshold = max(0.015, min(noise_floor * 2.2, 0.06))
-                    silence_threshold = max(0.010, speech_threshold * 0.75)
-                elif rms >= 0.04:
+                    noise_floor = min(float(np.percentile(calib_rms, 25)), 0.15)
+                    speech_threshold = max(0.015, noise_floor * 2.2 + 0.008)
+                    silence_threshold = max(0.010, noise_floor * 1.5 + 0.004)
+                elif rms >= 0.08:
                     speech_detected = True
                     last_speech_time = time.time()
                     return
@@ -1673,8 +1708,8 @@ class BotGUI:
                     return
             elif rms < noise_floor:
                 noise_floor = noise_floor * 0.9 + rms * 0.1
-                speech_threshold = max(0.015, min(noise_floor * 2.2, 0.06))
-                silence_threshold = max(0.010, speech_threshold * 0.75)
+                speech_threshold = max(0.015, noise_floor * 2.2 + 0.008)
+                silence_threshold = max(0.010, noise_floor * 1.5 + 0.004)
 
             if rms >= speech_threshold:
                 speech_detected = True
@@ -1723,6 +1758,9 @@ class BotGUI:
             flush=True,
         )
         if self.exiting or self.stop_event.is_set() or self.idle_event.is_set():
+            return None
+        if not speech_detected:
+            print("[AUDIO] No speech detected above floor — skipping transcription.", flush=True)
             return None
         return self.save_audio_buffer(buffer, filename, samplerate)
 
@@ -1782,10 +1820,13 @@ class BotGUI:
         if len(audio_data) < min_samples:
             print(f"[AUDIO] Recording too short ({len(audio_data)/samplerate:.2f}s) — skipping.", flush=True)
             return None
-        if getattr(audio_data, "dtype", None) != np.int16:
-            audio_data = np.nan_to_num(audio_data, nan=0.0, posinf=0.0, neginf=0.0)
-            audio_data = np.clip(audio_data, -1.0, 1.0)
-            audio_data = (audio_data * 32767).astype(np.int16)
+        if getattr(audio_data, "dtype", None) == np.int16:
+            audio_f = audio_data.astype(np.float32) / 32768.0
+        else:
+            audio_f = np.nan_to_num(audio_data.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        audio_f = _highpass_filter(audio_f, samplerate, cutoff_hz=150.0)
+        audio_f = np.clip(audio_f, -1.0, 1.0)
+        audio_data = (audio_f * 32767).astype(np.int16)
 
         WHISPER_RATE = 16000
         if samplerate != WHISPER_RATE:
@@ -1835,6 +1876,8 @@ class BotGUI:
                 if nchannels > 1:
                     audio_float32 = audio_float32.reshape(-1, nchannels).mean(axis=1)
 
+                audio_float32 = _highpass_filter(audio_float32, sr, cutoff_hz=150.0)
+
                 if sr != 16000:
                     from math import gcd
                     g = gcd(int(sr), 16000)
@@ -1851,24 +1894,48 @@ class BotGUI:
             segments, info = self.whisper_model.transcribe(
                 audio_float32,
                 language="en",
-                beam_size=1,
+                beam_size=2,
                 temperature=0.0,
+                initial_prompt="BMO is a cute, helpful robot assistant. Hey BMO.",
                 vad_filter=True,
                 vad_parameters=dict(
+                    threshold=0.5,
+                    min_speech_duration_ms=200,
                     min_silence_duration_ms=300,
                     speech_pad_ms=200,
                 ),
                 condition_on_previous_text=False,
-                no_speech_threshold=0.6,
+                no_speech_threshold=0.55,
                 compression_ratio_threshold=2.0,
                 log_prob_threshold=-0.8,
             )
-            
-            good_segments = [
-                seg.text for seg in segments
-                if seg.no_speech_prob < 0.6
+
+            HALLUCINATION_PHRASES = {
+                "thank you",
+                "thanks for watching",
+                "thank you for watching",
+                "you",
+                "bye",
+                "mbc",
+                "subtitles by",
+            }
+            kept_segs = [
+                seg for seg in segments
+                if getattr(seg, "no_speech_prob", 0.0) < 0.55
+                and getattr(seg, "avg_logprob", 0.0) > -0.85
             ]
-            transcription = " ".join(good_segments).strip()
+            transcription = " ".join(seg.text for seg in kept_segs).strip()
+            cleaned_lower = re.sub(r'[^a-z\s]', '', transcription.lower()).strip()
+            if (len(kept_segs) == 1 and cleaned_lower in HALLUCINATION_PHRASES
+                    and getattr(kept_segs[0], "no_speech_prob", 0.0) > 0.30):
+                transcription = ""
+
+            if transcription:
+                transcription = re.sub(r'\b(bimo|beemo)\b', 'BMO', transcription, flags=re.IGNORECASE)
+                transcription = re.sub(r'\bhey\s+be\s+more\b', 'Hey BMO', transcription, flags=re.IGNORECASE)
+                if re.fullmatch(r'be\s+more[.!?]*', transcription.strip(), flags=re.IGNORECASE):
+                    transcription = 'BMO'
+
             if not transcription:
                 print("[STT] Heard: (nothing confident)", flush=True)
                 return ""
@@ -1882,12 +1949,26 @@ class BotGUI:
     def _extract_ollama_content(resp):
         if resp is None:
             return ""
-        msg = resp.get('message') if isinstance(resp, dict) else getattr(resp, 'message', None)
-        if msg is None:
+        if isinstance(resp, dict):
+            msg = resp.get("message")
+            if msg is not None:
+                if isinstance(msg, dict):
+                    return msg.get("content", "") or ""
+                return getattr(msg, "content", "") or ""
+            if resp.get("response"):
+                return resp.get("response") or ""
+            choices = resp.get("choices")
+            if isinstance(choices, list) and choices:
+                c0 = choices[0] or {}
+                if isinstance(c0, dict):
+                    delta = c0.get("delta") or c0.get("message") or {}
+                    if isinstance(delta, dict):
+                        return delta.get("content", "") or ""
             return ""
-        if isinstance(msg, dict):
-            return msg.get('content', '') or ''
-        return getattr(msg, 'content', '') or ''
+        msg = getattr(resp, "message", None)
+        if msg is not None:
+            return getattr(msg, "content", "") or ""
+        return getattr(resp, "response", "") or ""
 
     def chat_and_respond(self, text):
         if "forget everything" in text.lower() or "reset memory" in text.lower():
@@ -1897,7 +1978,7 @@ class BotGUI:
             with self.tts_queue_lock:
                 self.tts_queue.append("Okay. Memory wiped.")
             self.set_state(BotStates.IDLE, "Memory Wiped")
-            return
+            return True
 
         self.set_state(BotStates.THINKING, "Thinking...")
         
@@ -1963,9 +2044,48 @@ class BotGUI:
                         self.tts_queue.append(text_sentence)
                 chunk_buffer = ""
 
+            if not full_response_buffer.strip() and not self.interrupted.is_set():
+                print("[LLM] Stream returned empty content — retrying non-streaming...", flush=True)
+                fallback_resp = OLLAMA_CLIENT.chat(
+                    model=TEXT_MODEL,
+                    messages=messages,
+                    stream=False,
+                    options=OLLAMA_OPTIONS,
+                )
+                fallback_raw = self._extract_ollama_content(fallback_resp)
+                fallback_clean = fallback_raw.encode('ascii', 'ignore').decode('ascii')
+                if not fallback_clean.strip():
+                    print(f"[LLM WARNING] Empty non-stream response: {fallback_resp!r}", flush=True)
+                    self.thinking_sound_active.clear()
+                    self.set_state(BotStates.IDLE, "No response.")
+                    return False
+
+                full_response_buffer = fallback_clean
+                if full_response_buffer.lstrip().startswith('{'):
+                    is_action_mode = True
+                    self.thinking_sound_active.clear()
+                else:
+                    self.thinking_sound_active.clear()
+                    self.append_to_text("BOT: ", newline=False)
+                    self.append_to_text(full_response_buffer, newline=True)
+                    with self.tts_queue_lock:
+                        self.tts_queue.append(full_response_buffer)
+
+            if full_response_buffer.strip():
+                print(f"[LLM] Reply ({len(full_response_buffer)} chars): {full_response_buffer[:200]!r}", flush=True)
+
             if is_action_mode:
                 action_data = self.extract_json_from_text(full_response_buffer)
-                if action_data:
+                if not action_data:
+                    print(f"[LLM WARNING] Malformed action JSON: {full_response_buffer[:200]!r}", flush=True)
+                    err_reply = "Sorry, I got confused on that one."
+                    self.thinking_sound_active.clear()
+                    self.set_state(BotStates.SPEAKING, "Speaking...")
+                    self.append_to_text("BOT: ", newline=False)
+                    self.append_to_text(err_reply, newline=True)
+                    with self.tts_queue_lock:
+                        self.tts_queue.append(err_reply)
+                else:
                     tool_result = self.execute_action_and_get_result(action_data)
 
                     if tool_result and tool_result.startswith("CHAT_FALLBACK::"):
@@ -1980,7 +2100,7 @@ class BotGUI:
                         self.save_chat_history()
                         self.wait_for_tts()
                         self.set_state(BotStates.IDLE, "Ready")
-                        return
+                        return True
 
                     if tool_result == "INVALID_ACTION":
                         fallback_text = "I am not sure how to do that."
@@ -2018,16 +2138,20 @@ class BotGUI:
                             self.tts_queue.append(final_text)
                         self.session_memory.append({"role": "assistant", "content": final_text})
             else:
-                self.append_to_text("")
-                self.session_memory.append({"role": "assistant", "content": full_response_buffer})
+                if full_response_buffer.strip():
+                    self.append_to_text("")
+                    self.session_memory.append({"role": "assistant", "content": full_response_buffer})
             
             self.save_chat_history()
             self.wait_for_tts()
             self.set_state(BotStates.IDLE, "Ready")
+            return bool(full_response_buffer.strip())
                 
         except Exception as e:
-            print(f"LLM Chat Error: {e}")
+            self.thinking_sound_active.clear()
+            print(f"LLM Chat Error: {e}", flush=True)
             self.set_state(BotStates.ERROR, "Brain Freeze!")
+            return False
 
     def wait_for_tts(self):
         while True:
@@ -2254,8 +2378,11 @@ class BotGUI:
                 with open(MEMORY_FILE, "r") as f:
                     history = json.load(f)
                     if history and len(history) > 0:
-                        history[0] = {"role": "system", "content": SYSTEM_PROMPT}
-                        return history
+                        cleaned = [
+                            m for m in history[1:]
+                            if isinstance(m, dict) and str(m.get("content", "")).strip() != ""
+                        ]
+                        return [{"role": "system", "content": SYSTEM_PROMPT}] + cleaned
             except:
                 pass
         return [{"role": "system", "content": SYSTEM_PROMPT}]
