@@ -2,6 +2,8 @@
 set -e
 
 NEEDS_REBOOT=0
+HAILO_GENAI_DEB_URL="${HAILO_GENAI_DEB_URL:-https://dev-public.hailo.ai/2025_12/Hailo10/hailo_gen_ai_model_zoo_5.1.1_arm64.deb}"
+HAILO_MODEL="${HAILO_MODEL:-qwen2.5:1.5b}"
 
 # 1. System & Hardware Dependencies (Raspberry Pi 5 ARM64 + AI HAT+ 2 Hailo-10H)
 sudo apt update
@@ -85,14 +87,23 @@ if ! command -v hailo-ollama >/dev/null 2>&1; then
     done
 
     if [ -n "$DEB_PKG" ]; then
-        echo "[HAILO] Installing GenAI Model Zoo package: $DEB_PKG..."
-        sudo dpkg -i "$DEB_PKG" || sudo apt install -f -y
+        echo "[HAILO] Installing local GenAI Model Zoo package: $DEB_PKG..."
+        sudo apt install -y "$DEB_PKG" || (sudo dpkg -i "$DEB_PKG" || sudo apt install -f -y)
     elif apt-cache show hailo-gen-ai-model-zoo >/dev/null 2>&1; then
         echo "[HAILO] Installing hailo-gen-ai-model-zoo via apt..."
         sudo apt install -y hailo-gen-ai-model-zoo
     elif apt-cache show hailo-ollama >/dev/null 2>&1; then
         echo "[HAILO] Installing hailo-ollama via apt..."
         sudo apt install -y hailo-ollama
+    else
+        TMP_DEB="/tmp/hailo_gen_ai_model_zoo_arm64.deb"
+        echo "[HAILO] Downloading Hailo GenAI Model Zoo (hailo-ollama) from $HAILO_GENAI_DEB_URL..."
+        if curl -fL -o "$TMP_DEB" "$HAILO_GENAI_DEB_URL"; then
+            sudo apt install -y "$TMP_DEB" || (sudo dpkg -i "$TMP_DEB" || sudo apt install -f -y)
+        else
+            echo "[WARNING] Failed to download $HAILO_GENAI_DEB_URL."
+        fi
+        rm -f "$TMP_DEB"
     fi
 fi
 
@@ -115,6 +126,7 @@ After=network.target
 [Service]
 Type=simple
 User=root
+Environment="OLLAMA_HOST=127.0.0.1:8000"
 ExecStart=${HAILO_OLLAMA_BIN}
 Restart=always
 RestartSec=5
@@ -138,7 +150,6 @@ EOF
     done
 
     if [ "$SERVER_UP" -eq 1 ]; then
-        HAILO_MODEL="${HAILO_MODEL:-qwen2.5:1.5b}"
         echo "[HAILO] Pulling Hailo NPU model (${HAILO_MODEL})..."
         if ! curl -sf -X POST "${HAILO_URL}/api/pull" \
             -H "Content-Type: application/json" \
