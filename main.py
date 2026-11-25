@@ -114,6 +114,9 @@ DEFAULT_CONFIG = {
     "system_prompt_extras": "",
     "input_device": None,
     "input_sample_rate": None,
+    "silence_duration": 0.9,
+    "no_speech_timeout": 4.0,
+    "max_record_time": 10.0,
     "servo_gpio1": 12,
     "servo_gpio2": 13,
     "camera_width": 640,
@@ -1367,6 +1370,7 @@ class BotGUI:
                     self.set_state(BotStates.IDLE, "Resetting...")
                     continue
 
+                self.idle_event.clear()
                 self.set_state(BotStates.LISTENING, "I'm listening!")
                 
                 audio_file = None
@@ -1630,57 +1634,82 @@ class BotGUI:
         if self.exiting or self.stop_event.is_set():
             return None
         print("Recording (Adaptive)...", flush=True)
-        time.sleep(0.5)
-        if self.exiting or self.stop_event.is_set() or self.idle_event.is_set():
-            return None
         samplerate = choose_input_samplerate(INPUT_DEVICE_NAME, CURRENT_CONFIG.get("input_sample_rate"))
 
-        silence_threshold = 0.006
-        silence_duration = 1.5
-        max_record_time = 30.0
+        silence_duration = float(CURRENT_CONFIG.get("silence_duration", 0.9))
+        no_speech_timeout = float(CURRENT_CONFIG.get("no_speech_timeout", 4.0))
+        max_record_time = float(CURRENT_CONFIG.get("max_record_time", 10.0))
+        blocksize = 1024
+        calib_chunks_needed = max(3, int(round(0.25 * samplerate / blocksize)))
+
         buffer = []
-        silent_chunks = 0
-        chunk_duration = 0.05
-        chunk_size = int(samplerate * chunk_duration)
-        
-        num_silent_chunks = int(silence_duration / chunk_duration)
-        max_chunks = int(max_record_time / chunk_duration)
-        recorded_chunks = 0
-        silence_started = False
+        calib_rms = []
+        noise_floor = 0.008
+        speech_threshold = 0.018
+        silence_threshold = 0.0135
+        speech_detected = False
+        last_speech_time = None
+        peak_rms = 0.0
 
         def callback(indata, frames, time_info, status):
-            nonlocal silent_chunks, recorded_chunks, silence_started
-            volume_norm = np.linalg.norm(indata) / np.sqrt(len(indata))
+            nonlocal noise_floor, speech_threshold, silence_threshold, speech_detected, last_speech_time, peak_rms
             buffer.append(indata.copy())
-            recorded_chunks += 1
-            if recorded_chunks < 5:
-                return
-            if volume_norm < silence_threshold:
-                silent_chunks += 1
-                if silent_chunks >= num_silent_chunks:
-                    silence_started = True
-            else:
-                silent_chunks = 0
+            chunk_f = indata.astype(np.float32).flatten() / 32768.0
+            rms = float(np.sqrt(np.mean(chunk_f * chunk_f))) if chunk_f.size > 0 else 0.0
+            if rms > peak_rms:
+                peak_rms = rms
+
+            if len(calib_rms) < calib_chunks_needed:
+                calib_rms.append(rms)
+                if len(calib_rms) == calib_chunks_needed:
+                    noise_floor = min(float(np.percentile(calib_rms, 25)), 0.035)
+                    speech_threshold = max(0.015, min(noise_floor * 2.2, 0.06))
+                    silence_threshold = max(0.010, speech_threshold * 0.75)
+                elif rms >= 0.04:
+                    speech_detected = True
+                    last_speech_time = time.time()
+                    return
+                else:
+                    return
+            elif rms < noise_floor:
+                noise_floor = noise_floor * 0.9 + rms * 0.1
+                speech_threshold = max(0.015, min(noise_floor * 2.2, 0.06))
+                silence_threshold = max(0.010, speech_threshold * 0.75)
+
+            if rms >= speech_threshold:
+                speech_detected = True
+                last_speech_time = time.time()
+            elif speech_detected and rms >= silence_threshold:
+                last_speech_time = time.time()
 
         stream = None
+        rec_start = time.time()
         try:
             sd.stop()
-            time.sleep(0.2)
+            time.sleep(0.1)
             if self.exiting or self.stop_event.is_set() or self.idle_event.is_set():
                 return None
             stream = sd.InputStream(
                 samplerate=samplerate,
                 channels=1,
+                dtype="int16",
                 callback=callback,
                 device=INPUT_DEVICE_NAME,
-                blocksize=chunk_size,
+                blocksize=blocksize,
                 latency="high",
             )
             stream.start()
-            while (not silence_started and recorded_chunks < max_chunks
-                   and not self.exiting and not self.stop_event.is_set()
-                   and not self.idle_event.is_set()):
-                time.sleep(chunk_duration)
+            rec_start = time.time()
+            while not self.exiting and not self.stop_event.is_set() and not self.idle_event.is_set():
+                now = time.time()
+                elapsed = now - rec_start
+                if elapsed >= max_record_time:
+                    break
+                if speech_detected and last_speech_time is not None and (now - last_speech_time) >= silence_duration:
+                    break
+                if not speech_detected and elapsed >= no_speech_timeout:
+                    break
+                time.sleep(0.05)
         except Exception as e:
             if not self.exiting and not self.stop_event.is_set():
                 print(f"[AUDIO ERROR] Adaptive recording failed: {e}", flush=True)
@@ -1688,6 +1717,11 @@ class BotGUI:
         finally:
             self._close_stream(stream)
 
+        print(
+            f"[AUDIO] Adaptive done ({time.time() - rec_start:.1f}s | speech={speech_detected} "
+            f"| peak_rms={peak_rms:.4f} | floor={noise_floor:.4f} | thresh={speech_threshold:.4f})",
+            flush=True,
+        )
         if self.exiting or self.stop_event.is_set() or self.idle_event.is_set():
             return None
         return self.save_audio_buffer(buffer, filename, samplerate)
@@ -1701,11 +1735,6 @@ class BotGUI:
             self.recording_active.set()
 
         print("Recording (PTT)...", flush=True)
-        time.sleep(0.5)
-        if self.exiting or self.stop_event.is_set() or self.idle_event.is_set():
-            self._cancel_auto_stop_timer()
-            self.recording_active.clear()
-            return None
         samplerate = choose_input_samplerate(INPUT_DEVICE_NAME, CURRENT_CONFIG.get("input_sample_rate"))
         buffer = []
         
@@ -1715,12 +1744,14 @@ class BotGUI:
         stream = None
         try:
             sd.stop()
-            time.sleep(0.2)
+            time.sleep(0.1)
             if self.exiting or self.stop_event.is_set() or self.idle_event.is_set():
                 return None
             stream = sd.InputStream(
                 samplerate=samplerate,
                 channels=1,
+                dtype="int16",
+                blocksize=1024,
                 callback=callback,
                 device=INPUT_DEVICE_NAME,
                 latency="high",
@@ -1751,8 +1782,10 @@ class BotGUI:
         if len(audio_data) < min_samples:
             print(f"[AUDIO] Recording too short ({len(audio_data)/samplerate:.2f}s) — skipping.", flush=True)
             return None
-        audio_data = np.nan_to_num(audio_data, nan=0.0, posinf=0.0, neginf=0.0)
-        audio_data = (audio_data * 32767).astype(np.int16)
+        if getattr(audio_data, "dtype", None) != np.int16:
+            audio_data = np.nan_to_num(audio_data, nan=0.0, posinf=0.0, neginf=0.0)
+            audio_data = np.clip(audio_data, -1.0, 1.0)
+            audio_data = (audio_data * 32767).astype(np.int16)
 
         WHISPER_RATE = 16000
         if samplerate != WHISPER_RATE:
