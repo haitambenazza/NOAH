@@ -22,6 +22,14 @@ import warnings
 import wave
 import queue
 
+# Tune CPU thread pools for Pi 5 (now that LLM runs on Hailo-10H NPU)
+# and cap Hugging Face Hub timeouts so Whisper doesn't stall on Wi-Fi/DNS.
+os.environ.setdefault("OMP_NUM_THREADS", "4")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "4")
+os.environ.setdefault("MKL_NUM_THREADS", "4")
+os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "10")
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "30")
+
 # Suppress harmless library warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="duckduckgo_search")
 
@@ -99,7 +107,8 @@ WAKE_WORD_THRESHOLD = 0.3
 INPUT_DEVICE_NAME = None
 
 DEFAULT_CONFIG = {
-    "text_model": "gemma3:1b",
+    "ollama_host": "http://localhost:8000",
+    "text_model": "qwen2.5:1.5b",
     "voice_model": "piper/en_GB-semaine-medium.onnx",
     "chat_memory": True,
     "system_prompt_extras": "",
@@ -112,16 +121,11 @@ DEFAULT_CONFIG = {
     "camera_fps": 15
 }
 
-# LLM SETTINGS
-# num_thread=2 keeps 2 cores free on the Pi 4 for audio, wake-word, and camera pipelines.
-# num_ctx=512 prevents memory swap thrashing.
+# LLM SETTINGS (Hailo-10H NPU via hailo-ollama)
 OLLAMA_OPTIONS = {
-    'keep_alive': '-1',
-    'num_thread': 2,
-    'num_ctx': 512,
     'temperature': 0.7,
     'top_k': 40,
-    'top_p': 0.9
+    'top_p': 0.9,
 }
 
 def load_config():
@@ -137,6 +141,9 @@ def load_config():
 
 CURRENT_CONFIG = load_config()
 TEXT_MODEL = CURRENT_CONFIG["text_model"]
+OLLAMA_HOST = CURRENT_CONFIG.get("ollama_host", "http://localhost:8000")
+OLLAMA_CLIENT = ollama.Client(host=OLLAMA_HOST)
+print(f"[LLM] Configured Ollama client: host={OLLAMA_HOST} model={TEXT_MODEL}", flush=True)
 
 # USB microphone keywords for auto-detection
 USB_MIC_KEYWORDS = ["usb", "pnp", "uac", "microphone", "mic"]
@@ -794,10 +801,26 @@ class BotGUI:
         self.whisper_model = None
         if WHISPER_AVAILABLE:
             try:
-                self.whisper_model = WhisperModel("tiny.en", device="cpu", compute_type="int8")
-                print("[INIT] Whisper ready.", flush=True)
-            except Exception as e:
-                print(f"[CRITICAL] Whisper failed to load: {e}", flush=True)
+                self.whisper_model = WhisperModel(
+                    "tiny.en",
+                    device="cpu",
+                    compute_type="int8",
+                    cpu_threads=4,
+                    local_files_only=True,
+                )
+                print("[INIT] Whisper ready (local cache).", flush=True)
+            except Exception as local_err:
+                print(f"[INIT] Whisper local cache miss ({local_err}); downloading...", flush=True)
+                try:
+                    self.whisper_model = WhisperModel(
+                        "tiny.en",
+                        device="cpu",
+                        compute_type="int8",
+                        cpu_threads=4,
+                    )
+                    print("[INIT] Whisper ready (downloaded).", flush=True)
+                except Exception as e:
+                    print(f"[CRITICAL] Whisper failed to load: {e}", flush=True)
         else:
             print("[CRITICAL] Whisper STT unavailable.")
 
@@ -1035,7 +1058,7 @@ class BotGUI:
 
         # Shutdown Ollama connection keepalive and free resources
         try:
-            ollama.generate(model=TEXT_MODEL, prompt="", keep_alive=0)
+            OLLAMA_CLIENT.generate(model=TEXT_MODEL, prompt="", keep_alive=0)
         except:
             pass
         try:
@@ -1311,10 +1334,18 @@ class BotGUI:
     def warm_up_logic(self):
         self.set_state(BotStates.WARMUP, "Warming up brains...")
         try:
-            # Tell Ollama to load model and pin to memory (keep_alive = -1)
-            ollama.generate(model=TEXT_MODEL, prompt="", keep_alive=-1)
-        except Exception as e:
-            print(f"Failed loading LLM model {TEXT_MODEL}: {e}", flush=True)
+            # Tell Ollama/hailo-ollama to load model into NPU memory
+            OLLAMA_CLIENT.generate(model=TEXT_MODEL, prompt="", keep_alive=-1)
+        except Exception as gen_err:
+            try:
+                OLLAMA_CLIENT.chat(
+                    model=TEXT_MODEL,
+                    messages=[{"role": "user", "content": "hi"}],
+                    stream=False,
+                    options=OLLAMA_OPTIONS,
+                )
+            except Exception as e:
+                print(f"Failed loading LLM model {TEXT_MODEL}: {gen_err} / {e}", flush=True)
         
         self.play_sound(self.get_random_sound(greeting_sounds_dir))
         print("[INIT] Models loaded & active.", flush=True)
@@ -1736,6 +1767,17 @@ class BotGUI:
             print(f"[STT ERROR] Whisper decoding failed: {e}", flush=True)
             return ""
 
+    @staticmethod
+    def _extract_ollama_content(resp):
+        if resp is None:
+            return ""
+        msg = resp.get('message') if isinstance(resp, dict) else getattr(resp, 'message', None)
+        if msg is None:
+            return ""
+        if isinstance(msg, dict):
+            return msg.get('content', '') or ''
+        return getattr(msg, 'content', '') or ''
+
     def chat_and_respond(self, text):
         if "forget everything" in text.lower() or "reset memory" in text.lower():
             self.session_memory = []
@@ -1759,14 +1801,16 @@ class BotGUI:
         chunk_buffer = ""
 
         try:
-            stream = ollama.chat(model=TEXT_MODEL, messages=messages, stream=True, options=OLLAMA_OPTIONS)
+            stream = OLLAMA_CLIENT.chat(model=TEXT_MODEL, messages=messages, stream=True, options=OLLAMA_OPTIONS)
             is_action_mode = False
             bot_label_written = False
 
             for chunk in stream:
                 if self.interrupted.is_set():
                     break
-                raw = chunk['message']['content']
+                raw = self._extract_ollama_content(chunk)
+                if not raw:
+                    continue
                 content = raw.encode('ascii', 'ignore').decode('ascii')
                 full_response_buffer += content
 
@@ -1847,8 +1891,8 @@ class BotGUI:
                         self.set_state(BotStates.THINKING, "Reading...")
                         self.thinking_sound_active.set()
                         
-                        final_resp = ollama.chat(model=TEXT_MODEL, messages=summary_prompt, stream=False, options=OLLAMA_OPTIONS)
-                        final_text = final_resp['message']['content']
+                        final_resp = OLLAMA_CLIENT.chat(model=TEXT_MODEL, messages=summary_prompt, stream=False, options=OLLAMA_OPTIONS)
+                        final_text = self._extract_ollama_content(final_resp)
                         
                         self.thinking_sound_active.clear()
                         self.set_state(BotStates.SPEAKING, "Speaking...")
