@@ -1434,8 +1434,44 @@ class BotGUI:
             print("[STT ERROR] Whisper model not loaded.", flush=True)
             return ""
         try:
+            if isinstance(filename, np.ndarray):
+                audio_float32 = np.ascontiguousarray(filename.squeeze(), dtype=np.float32)
+            else:
+                with wave.open(filename, "rb") as wf:
+                    sr = wf.getframerate()
+                    nchannels = wf.getnchannels()
+                    sampwidth = wf.getsampwidth()
+                    raw_bytes = wf.readframes(wf.getnframes())
+
+                if not raw_bytes:
+                    print("[STT] Heard: (empty audio)", flush=True)
+                    return ""
+
+                if sampwidth == 2:
+                    audio_float32 = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+                elif sampwidth == 4:
+                    audio_float32 = np.frombuffer(raw_bytes, dtype=np.int32).astype(np.float32) / 2147483648.0
+                else:
+                    raise ValueError(f"Unsupported WAV sample width: {sampwidth} bytes")
+
+                if nchannels > 1:
+                    audio_float32 = audio_float32.reshape(-1, nchannels).mean(axis=1)
+
+                if sr != 16000:
+                    from math import gcd
+                    g = gcd(int(sr), 16000)
+                    audio_float32 = scipy.signal.resample_poly(
+                        audio_float32, 16000 // g, int(sr) // g
+                    ).astype(np.float32)
+
+                audio_float32 = np.ascontiguousarray(audio_float32, dtype=np.float32)
+
+            if audio_float32.size == 0:
+                print("[STT] Heard: (empty audio)", flush=True)
+                return ""
+
             segments, info = self.whisper_model.transcribe(
-                filename,
+                audio_float32,
                 language="en",
                 beam_size=1,
                 temperature=0.0,
