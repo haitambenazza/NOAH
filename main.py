@@ -1343,7 +1343,7 @@ class BotGUI:
 
         input_rate = choose_input_samplerate(INPUT_DEVICE_NAME, CURRENT_CONFIG.get("input_sample_rate"))
         use_resampling = (input_rate != OWW_SAMPLE_RATE)
-        BLOCK_SIZE = 512
+        BLOCK_SIZE = 1024
 
         stream_args = {
             "samplerate": input_rate,
@@ -1351,7 +1351,7 @@ class BotGUI:
             "dtype": 'int16',
             "blocksize": BLOCK_SIZE,
             "device": INPUT_DEVICE_NAME,
-            "latency": "low",
+            "latency": "high",
         }
 
         print(f"[AUDIO] Wake word stream: {input_rate}Hz resample={use_resampling}", flush=True)
@@ -1374,33 +1374,94 @@ class BotGUI:
             return "EXIT"
         return "WAKE"
 
+    def _close_stream(self, stream):
+        """Aborts and closes a sounddevice stream without blocking in Pa_StopStream."""
+        if stream is None:
+            return
+        try:
+            stream.abort(ignore_errors=True)
+        except TypeError:
+            try:
+                stream.abort()
+            except Exception:
+                pass
+        except Exception:
+            pass
+        try:
+            stream.close(ignore_errors=True)
+        except TypeError:
+            try:
+                stream.close()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
     def _listen_loop(self, stream_args, input_rate, oww_rate, oww_chunk, use_resampling):
         needed_input_samples = int(oww_chunk * (input_rate / oww_rate)) if use_resampling else oww_chunk
         accumulator = np.array([], dtype=np.int16)
         overflow_count = 0
         MAX_OVERFLOWS = 30
+        audio_q = queue.Queue(maxsize=64)
 
-        with sd.InputStream(**stream_args) as stream:
+        def _audio_cb(indata, frames, time_info, status):
+            if status and getattr(status, "input_overflow", False):
+                try:
+                    audio_q.put_nowait((None, True))
+                except queue.Full:
+                    pass
+                return
+            try:
+                audio_q.put_nowait((indata.copy(), False))
+            except queue.Full:
+                try:
+                    audio_q.get_nowait()
+                    audio_q.put_nowait((indata.copy(), False))
+                except (queue.Empty, queue.Full):
+                    pass
+
+        cb_args = dict(stream_args)
+        cb_args["callback"] = _audio_cb
+        stream = sd.InputStream(**cb_args)
+        stream.start()
+        try:
             while not self.exiting and not self.stop_event.is_set():
                 # Polling interrupts
+                if self.exiting or self.stop_event.is_set():
+                    raise StopIteration("EXIT")
                 if self.ptt_event.is_set():
                     self.ptt_event.clear()
+                    print("\n[AUDIO] Wake word stream interrupted by PTT.", flush=True)
                     raise StopIteration("PTT")
-                
-                rlist, _, _ = select.select([sys.stdin], [], [], 0)
-                if rlist:
-                    sys.stdin.readline()
-                    raise StopIteration("CLI")
 
                 try:
-                    data, overflow = stream.read(stream_args["blocksize"])
-                except Exception as e:
+                    rlist, _, _ = select.select([sys.stdin], [], [], 0)
+                    if rlist:
+                        sys.stdin.readline()
+                        raise StopIteration("CLI")
+                except StopIteration:
+                    raise
+                except Exception:
+                    pass
+
+                try:
+                    data, overflow = audio_q.get(timeout=0.05)
+                except queue.Empty:
                     if self.exiting or self.stop_event.is_set():
                         raise StopIteration("EXIT")
-                    raise RuntimeError(f"Stream read failure: {e}")
+                    if self.ptt_event.is_set():
+                        self.ptt_event.clear()
+                        print("\n[AUDIO] Wake word stream interrupted by PTT.", flush=True)
+                        raise StopIteration("PTT")
+                    continue
 
                 if self.exiting or self.stop_event.is_set():
                     raise StopIteration("EXIT")
+
+                if self.ptt_event.is_set():
+                    self.ptt_event.clear()
+                    print("\n[AUDIO] Wake word stream interrupted by PTT.", flush=True)
+                    raise StopIteration("PTT")
 
                 if overflow:
                     overflow_count += 1
@@ -1410,7 +1471,7 @@ class BotGUI:
                 else:
                     overflow_count = max(0, overflow_count - 1)
 
-                chunk = np.frombuffer(data, dtype=np.int16)
+                chunk = np.asarray(data, dtype=np.int16)
                 if chunk.ndim > 1:
                     chunk = chunk.flatten()
                 accumulator = np.concatenate((accumulator, chunk))
@@ -1450,6 +1511,8 @@ class BotGUI:
                             return
 
                 print(f"\r[MIC] {level_label} |{bar}| {current_max:5d}{oww_score_str}   ", end="", flush=True)
+        finally:
+            self._close_stream(stream)
 
         if self.exiting or self.stop_event.is_set():
             raise StopIteration("EXIT")
@@ -1490,21 +1553,31 @@ class BotGUI:
             else:
                 silent_chunks = 0
 
+        stream = None
         try:
             sd.stop()
             time.sleep(0.2)
             if self.exiting or self.stop_event.is_set() or self.idle_event.is_set():
                 return None
-            with sd.InputStream(samplerate=samplerate, channels=1, callback=callback, 
-                                device=INPUT_DEVICE_NAME, blocksize=chunk_size):
-                while (not silence_started and recorded_chunks < max_chunks
-                       and not self.exiting and not self.stop_event.is_set()
-                       and not self.idle_event.is_set()):
-                    sd.sleep(int(chunk_duration * 1000))
+            stream = sd.InputStream(
+                samplerate=samplerate,
+                channels=1,
+                callback=callback,
+                device=INPUT_DEVICE_NAME,
+                blocksize=chunk_size,
+                latency="high",
+            )
+            stream.start()
+            while (not silence_started and recorded_chunks < max_chunks
+                   and not self.exiting and not self.stop_event.is_set()
+                   and not self.idle_event.is_set()):
+                time.sleep(chunk_duration)
         except Exception as e:
             if not self.exiting and not self.stop_event.is_set():
                 print(f"[AUDIO ERROR] Adaptive recording failed: {e}", flush=True)
             return None
+        finally:
+            self._close_stream(stream)
 
         if self.exiting or self.stop_event.is_set() or self.idle_event.is_set():
             return None
@@ -1530,21 +1603,30 @@ class BotGUI:
         def callback(indata, frames, time_info, status):
             buffer.append(indata.copy())
         
+        stream = None
         try:
             sd.stop()
             time.sleep(0.2)
             if self.exiting or self.stop_event.is_set() or self.idle_event.is_set():
                 return None
-            with sd.InputStream(samplerate=samplerate, channels=1, callback=callback, device=INPUT_DEVICE_NAME):
-                if duration is not None:
-                    self._start_auto_stop_timer(duration)
-                while self.recording_active.is_set() and not self.exiting and not self.stop_event.is_set():
-                    sd.sleep(50)
+            stream = sd.InputStream(
+                samplerate=samplerate,
+                channels=1,
+                callback=callback,
+                device=INPUT_DEVICE_NAME,
+                latency="high",
+            )
+            stream.start()
+            if duration is not None:
+                self._start_auto_stop_timer(duration)
+            while self.recording_active.is_set() and not self.exiting and not self.stop_event.is_set():
+                time.sleep(0.05)
         except Exception as e:
             if not self.exiting and not self.stop_event.is_set():
                 print(f"[AUDIO ERROR] PTT recording failed: {e}", flush=True)
             return None
         finally:
+            self._close_stream(stream)
             self._cancel_auto_stop_timer()
             self.recording_active.clear()
 
