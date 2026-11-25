@@ -129,6 +129,7 @@ OLLAMA_OPTIONS = {
     'temperature': 0.7,
     'top_k': 40,
     'top_p': 0.9,
+    'repeat_penalty': 1.15,
 }
 
 def load_config():
@@ -608,13 +609,16 @@ class ObjectDetector:
         if self._initialized: return True
         try:
             os.makedirs(self.model_dir, exist_ok=True)
-            import urllib.request
-            if not os.path.exists(self.proto_path):
-                print(f"[VISION] Downloading prototxt: {self.proto_url}...", flush=True)
-                urllib.request.urlretrieve(self.proto_url, self.proto_path)
-            if not os.path.exists(self.model_path):
-                print(f"[VISION] Downloading caffemodel weights: {self.model_url}...", flush=True)
-                urllib.request.urlretrieve(self.model_url, self.model_path)
+            for url, path, label in (
+                (self.proto_url, self.proto_path, "prototxt"),
+                (self.model_url, self.model_path, "caffemodel weights"),
+            ):
+                if not os.path.exists(path):
+                    print(f"[VISION] Downloading {label}: {url}...", flush=True)
+                    r = requests.get(url, timeout=20)
+                    r.raise_for_status()
+                    with open(path, "wb") as f:
+                        f.write(r.content)
             if CV2_AVAILABLE:
                 self.net = cv2.dnn.readNetFromCaffe(self.proto_path, self.model_path)
                 self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
@@ -929,7 +933,12 @@ class BotGUI:
         self.tts_active = threading.Event()
         self.idle_event = threading.Event()
         self.auto_listen = True
+        self._auto_followup = False
+        self._last_assistant_reply_norm = ""
+        self._last_user_text_norm = ""
         self.current_audio_process = None
+        self.motor_controller = None
+        self.camera_pipeline = None
         self.exiting = False
 
         # --- SUB-THREAD INITIALIZATION ---
@@ -1147,6 +1156,7 @@ class BotGUI:
 
     def handle_idle_button(self):
         print("[IDLE BTN] Forcing idle", flush=True)
+        self._auto_followup = False
         self._cancel_auto_stop_timer()
         self.idle_event.set()
         self.interrupted.set()
@@ -1385,7 +1395,7 @@ class BotGUI:
 
         if action == "get_time":
             now = datetime.datetime.now().strftime("%I:%M %p")
-            return f"The current time is {now}."
+            return f"CHAT_FALLBACK::The current time is {now}."
             
         elif action == "describe_view":
             if self.camera_pipeline and self.camera_pipeline.latest_frame is not None:
@@ -1397,11 +1407,11 @@ class BotGUI:
                 self.set_state(BotStates.THINKING, "Looking around...")
                 detected = detector.detect_objects(self.camera_pipeline.latest_frame)
                 if detected:
-                    return f"I see: {', '.join(detected)}."
+                    return f"CHAT_FALLBACK::I see: {', '.join(detected)}."
                 else:
-                    return "I don't see any recognizable objects."
+                    return "CHAT_FALLBACK::I don't see any recognizable objects."
             else:
-                return "My camera is currently inactive or warming up."
+                return "CHAT_FALLBACK::My camera is currently inactive or warming up."
         
         elif action == "search_web":
             if not DDGS_AVAILABLE:
@@ -1452,22 +1462,36 @@ class BotGUI:
             self.tts_thread.start()
             
             while not self.exiting and not self.stop_event.is_set():
-                trigger_source = self.detect_wake_word_or_ptt()
-                if trigger_source == "EXIT" or self.exiting or self.stop_event.is_set():
-                    break
-                if self.interrupted.is_set():
-                    self.interrupted.clear()
-                    self.set_state(BotStates.IDLE, "Resetting...")
-                    continue
-
-                self.idle_event.clear()
-                self.set_state(BotStates.LISTENING, "I'm listening!")
-                
-                audio_file = None
-                if trigger_source == "PTT":
-                    audio_file = self.record_voice_ptt()
+                if self._auto_followup:
+                    self._auto_followup = False
+                    if self.idle_event.is_set() or self.interrupted.is_set():
+                        continue
+                    if self.ptt_event.is_set():
+                        self.ptt_event.clear()
+                        self.idle_event.clear()
+                        self.set_state(BotStates.LISTENING, "I'm listening!")
+                        audio_file = self.record_voice_ptt()
+                    else:
+                        self.idle_event.clear()
+                        self.set_state(BotStates.LISTENING, "Listening for follow-up...")
+                        audio_file = self.record_voice_adaptive()
                 else:
-                    audio_file = self.record_voice_adaptive()
+                    trigger_source = self.detect_wake_word_or_ptt()
+                    if trigger_source == "EXIT" or self.exiting or self.stop_event.is_set():
+                        break
+                    if self.interrupted.is_set():
+                        self.interrupted.clear()
+                        self.set_state(BotStates.IDLE, "Resetting...")
+                        continue
+
+                    self.idle_event.clear()
+                    self.set_state(BotStates.LISTENING, "I'm listening!")
+                    
+                    audio_file = None
+                    if trigger_source == "PTT":
+                        audio_file = self.record_voice_ptt()
+                    else:
+                        audio_file = self.record_voice_adaptive()
 
                 if self.exiting or self.stop_event.is_set():
                     break
@@ -1490,13 +1514,10 @@ class BotGUI:
                 if self.exiting or self.stop_event.is_set():
                     break
 
-                # Restart listening trigger unless idle commanded or reply failed
-                if replied and not self.idle_event.is_set() and not self.exiting and not self.stop_event.is_set():
-                    print("[AUTO] Listening active again...", flush=True)
-                    self._cancel_auto_stop_timer()
-                    self.ptt_auto_stop_duration = 5.0
-                    self.recording_active.set()
-                    self.ptt_event.set()
+                # Restart adaptive follow-up listening unless idle commanded or reply failed
+                if replied and self.auto_listen and not self.idle_event.is_set() and not self.exiting and not self.stop_event.is_set():
+                    print("[AUTO] Listening for follow-up (Adaptive)...", flush=True)
+                    self._auto_followup = True
                     
         except Exception as e:
             if not self.exiting and not self.stop_event.is_set():
@@ -2060,10 +2081,16 @@ class BotGUI:
             return getattr(msg, "content", "") or ""
         return getattr(resp, "response", "") or ""
 
+    @staticmethod
+    def _norm_text(s):
+        return re.sub(r'[^a-z0-9]+', ' ', str(s).lower()).strip()
+
     def chat_and_respond(self, text):
         if "forget everything" in text.lower() or "reset memory" in text.lower():
             self.session_memory = []
             self.permanent_memory = [{"role": "system", "content": SYSTEM_PROMPT}]
+            self._last_assistant_reply_norm = ""
+            self._last_user_text_norm = ""
             self.save_chat_history()
             with self.tts_queue_lock:
                 self.tts_queue.append("Okay. Memory wiped.")
@@ -2164,6 +2191,33 @@ class BotGUI:
             if full_response_buffer.strip():
                 print(f"[LLM] Reply ({len(full_response_buffer)} chars): {full_response_buffer[:200]!r}", flush=True)
 
+            user_norm = self._norm_text(text)
+            reply_norm = self._norm_text(full_response_buffer)
+            if (not is_action_mode and reply_norm
+                    and reply_norm == self._last_assistant_reply_norm
+                    and user_norm != self._last_user_text_norm):
+                print("[LLM] Repetition loop detected — clearing context and retrying fresh...", flush=True)
+                self.permanent_memory = [{"role": "system", "content": SYSTEM_PROMPT}]
+                self.session_memory = [user_msg]
+                fresh_resp = OLLAMA_CLIENT.chat(
+                    model=TEXT_MODEL,
+                    messages=[{"role": "system", "content": SYSTEM_PROMPT}, user_msg],
+                    stream=False,
+                    options=OLLAMA_OPTIONS,
+                )
+                fresh_raw = self._extract_ollama_content(fresh_resp)
+                fresh_clean = fresh_raw.encode('ascii', 'ignore').decode('ascii').strip()
+                if fresh_clean and self._norm_text(fresh_clean) != reply_norm:
+                    full_response_buffer = fresh_clean
+                    if full_response_buffer.lstrip().startswith('{'):
+                        is_action_mode = True
+                    else:
+                        with self.tts_queue_lock:
+                            self.tts_queue.clear()
+                            self.tts_queue.append(full_response_buffer)
+                        self.append_to_text("BOT: ", newline=False)
+                        self.append_to_text(full_response_buffer, newline=True)
+
             if is_action_mode:
                 action_data = self.extract_json_from_text(full_response_buffer)
                 if not action_data:
@@ -2187,6 +2241,8 @@ class BotGUI:
                         with self.tts_queue_lock:
                             self.tts_queue.append(chat_text)
                         self.session_memory.append({"role": "assistant", "content": chat_text})
+                        self._last_assistant_reply_norm = self._norm_text(chat_text)
+                        self._last_user_text_norm = user_norm
                         self.save_chat_history()
                         self.wait_for_tts()
                         self.set_state(BotStates.IDLE, "Ready")
@@ -2208,6 +2264,8 @@ class BotGUI:
                         self.append_to_text(fallback_text, newline=True)
                         with self.tts_queue_lock:
                             self.tts_queue.append(fallback_text)
+                        self._last_assistant_reply_norm = self._norm_text(fallback_text)
+                        self._last_user_text_norm = user_norm
                     elif tool_result:
                         summary_prompt = [
                             {"role": "system", "content": "Summarize this result in one short sentence."},
@@ -2226,11 +2284,16 @@ class BotGUI:
                         self.append_to_text(final_text, newline=True)
                         with self.tts_queue_lock:
                             self.tts_queue.append(final_text)
-                        self.session_memory.append({"role": "assistant", "content": final_text})
+                        if final_text.strip():
+                            self.session_memory.append({"role": "assistant", "content": final_text})
+                            self._last_assistant_reply_norm = self._norm_text(final_text)
+                            self._last_user_text_norm = user_norm
             else:
                 if full_response_buffer.strip():
                     self.append_to_text("")
                     self.session_memory.append({"role": "assistant", "content": full_response_buffer})
+                    self._last_assistant_reply_norm = self._norm_text(full_response_buffer)
+                    self._last_user_text_norm = user_norm
             
             self.save_chat_history()
             self.wait_for_tts()
@@ -2245,11 +2308,13 @@ class BotGUI:
 
     def wait_for_tts(self):
         while True:
-            if self.interrupted.is_set():
+            if self.interrupted.is_set() or self.exiting or self.stop_event.is_set():
                 break
             with self.tts_queue_lock:
                 empty = len(self.tts_queue) == 0
             if empty and not self.tts_active.is_set():
+                # Let ALSA playback tail finish before reopening microphone
+                time.sleep(0.6)
                 break
             time.sleep(0.05)
 
@@ -2472,6 +2537,14 @@ class BotGUI:
                             m for m in history[1:]
                             if isinstance(m, dict) and str(m.get("content", "")).strip() != ""
                         ]
+                        prev_a = None
+                        for m in cleaned:
+                            if m.get("role") == "assistant":
+                                cur_a = self._norm_text(m.get("content", ""))
+                                if cur_a and cur_a == prev_a:
+                                    print("[MEM] Cleared repetitive history from memory.json.", flush=True)
+                                    return [{"role": "system", "content": SYSTEM_PROMPT}]
+                                prev_a = cur_a
                         return [{"role": "system", "content": SYSTEM_PROMPT}] + cleaned
             except:
                 pass
@@ -2480,8 +2553,8 @@ class BotGUI:
     def save_chat_history(self):
         full = self.permanent_memory + self.session_memory
         conv = full[1:]
-        if len(conv) > 10:
-            conv = conv[-10:]
+        if len(conv) > 6:
+            conv = conv[-6:]
         try:
             with open(MEMORY_FILE, "w") as f:
                 json.dump([full[0]] + conv, f, indent=4)
