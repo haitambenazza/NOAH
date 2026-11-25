@@ -720,6 +720,7 @@ class BotGUI:
         # User Interaction Bindings
         master.bind('<Return>', self.handle_ptt_toggle)
         master.bind('<space>', self.handle_speaking_interrupt)
+        master.protocol("WM_DELETE_WINDOW", self.safe_exit)
         atexit.register(self.safe_exit)
         
         # Core State
@@ -733,13 +734,20 @@ class BotGUI:
         self.thinking_sound_active = threading.Event()
         
         self.last_ptt_time = 0
+        self.last_wake_time = 0
+        self._auto_stop_timer = None
+        self._auto_stop_lock = threading.Lock()
+        self._record_gen = 0
+        self.ptt_auto_stop_duration = None
         self.ptt_event = threading.Event()
         self.recording_active = threading.Event()
         self.interrupted = threading.Event()
+        self.stop_event = threading.Event()
         
         self.tts_queue = []
         self.tts_queue_lock = threading.Lock()
         self.tts_thread = None
+        self.agent_thread = None
         self.tts_active = threading.Event()
         self.idle_event = threading.Event()
         self.auto_listen = True
@@ -822,7 +830,8 @@ class BotGUI:
         self.update_animation()
         
         # Start conversational agent engine loop in its own thread
-        threading.Thread(target=self.safe_main_execution, daemon=True, name="AgentLoopThread").start()
+        self.agent_thread = threading.Thread(target=self.safe_main_execution, daemon=True, name="AgentLoopThread")
+        self.agent_thread.start()
 
     # --- UI EVENT HANDLERS ---
 
@@ -880,6 +889,31 @@ class BotGUI:
         except tk.TclError:
             pass
 
+    def _cancel_auto_stop_timer(self):
+        with self._auto_stop_lock:
+            self._record_gen += 1
+            if self._auto_stop_timer is not None:
+                self._auto_stop_timer.cancel()
+                self._auto_stop_timer = None
+
+    def _start_auto_stop_timer(self, duration=5.0):
+        with self._auto_stop_lock:
+            if self._auto_stop_timer is not None:
+                self._auto_stop_timer.cancel()
+            self._record_gen += 1
+            gen = self._record_gen
+
+            def _stop_if_current():
+                with self._auto_stop_lock:
+                    if self._record_gen == gen:
+                        self.recording_active.clear()
+                        self._auto_stop_timer = None
+
+            timer = threading.Timer(duration, _stop_if_current)
+            timer.daemon = True
+            self._auto_stop_timer = timer
+            timer.start()
+
     def handle_ptt_toggle(self, event=None):
         current_time = time.time()
         if current_time - self.last_ptt_time < 0.5:
@@ -888,29 +922,42 @@ class BotGUI:
 
         if self.recording_active.is_set():
             print("[PTT] Toggle OFF", flush=True)
+            self._cancel_auto_stop_timer()
             self.recording_active.clear()
         else:
             if self.current_state == BotStates.IDLE or "Wait" in self.status_var.get():
                 print("[PTT] Toggle ON", flush=True)
+                self._cancel_auto_stop_timer()
+                self.ptt_auto_stop_duration = None
+                self.idle_event.clear()
                 self.recording_active.set()
                 self.ptt_event.set()
 
     def handle_wake_button(self):
+        now = time.time()
+        if now - self.last_wake_time < 0.5:
+            return
+        self.last_wake_time = now
+
+        if self.current_state == BotStates.LISTENING and self.recording_active.is_set():
+            print("[WAKE BTN] Already listening — ignoring duplicate trigger.", flush=True)
+            return
+
         print("[WAKE BTN] Manual wake triggered", flush=True)
+        self._cancel_auto_stop_timer()
         self.idle_event.clear()
+        self.interrupted.clear()
+        self.ptt_auto_stop_duration = 5.0
         self.recording_active.set()
         self.ptt_event.set()
-        
-        def _auto_stop():
-            time.sleep(5)
-            self.recording_active.clear()
-        threading.Thread(target=_auto_stop, daemon=True).start()
 
     def handle_idle_button(self):
         print("[IDLE BTN] Forcing idle", flush=True)
+        self._cancel_auto_stop_timer()
         self.idle_event.set()
         self.interrupted.set()
         self.recording_active.clear()
+        self.ptt_event.clear()
         with self.tts_queue_lock:
             self.tts_queue.clear()
         if self.current_audio_process:
@@ -941,8 +988,36 @@ class BotGUI:
         if self.exiting:
             return
         self.exiting = True
+        self.stop_event.set()
+        self.interrupted.set()
+        self.idle_event.set()
+        self._cancel_auto_stop_timer()
         print("\n--- SHUTDOWN SEQUENCE STARTED ---", flush=True)
-        
+
+        self.recording_active.clear()
+        self.thinking_sound_active.clear()
+        self.tts_active.clear()
+        with self.tts_queue_lock:
+            self.tts_queue.clear()
+        self.ptt_event.set()  # Unblock any thread waiting on ptt_event
+
+        # Wait for audio/agent worker threads to exit their streams BEFORE tearing down PortAudio
+        current = threading.current_thread()
+        agent_thread = getattr(self, "agent_thread", None)
+        if agent_thread and agent_thread.is_alive() and agent_thread is not current:
+            agent_thread.join(timeout=2.0)
+        tts_thread = getattr(self, "tts_thread", None)
+        if tts_thread and tts_thread.is_alive() and tts_thread is not current:
+            tts_thread.join(timeout=1.5)
+
+        piper_proc = getattr(self, "_piper_process", None)
+        if piper_proc and piper_proc.poll() is None:
+            try:
+                piper_proc.terminate()
+                piper_proc.wait(timeout=1)
+            except Exception:
+                pass
+
         # Stop sub-threads
         if self.camera_pipeline:
             self.camera_pipeline.stop()
@@ -956,12 +1031,8 @@ class BotGUI:
             except:
                 pass
 
-        self.recording_active.clear()
-        self.thinking_sound_active.clear()
-        self.tts_active.clear()
-        
         self.save_chat_history()
-        
+
         # Shutdown Ollama connection keepalive and free resources
         try:
             ollama.generate(model=TEXT_MODEL, prompt="", keep_alive=0)
@@ -1033,7 +1104,11 @@ class BotGUI:
         self.master.after(speed, self.update_animation)
 
     def set_state(self, state, msg=""):
+        if self.exiting:
+            return
         def _update():
+            if self.exiting:
+                return
             if msg:
                 print(f"[STATE] {state.upper()}: {msg}", flush=True)
             if self.current_state != state:
@@ -1041,9 +1116,14 @@ class BotGUI:
                 self.current_frame_index = 0
             if msg:
                 self.status_var.set(msg)
-        self.master.after(0, _update)
+        try:
+            self.master.after(0, _update)
+        except (tk.TclError, RuntimeError):
+            pass
 
     def append_to_text(self, text, newline=True):
+        if self.exiting:
+            return
         def _update():
             try:
                 self.response_text.config(state=tk.NORMAL)
@@ -1055,9 +1135,14 @@ class BotGUI:
                 self.response_text.config(state=tk.DISABLED)
             except tk.TclError:
                 pass
-        self.master.after(0, _update)
+        try:
+            self.master.after(0, _update)
+        except (tk.TclError, RuntimeError):
+            pass
 
     def _stream_to_text(self, chunk):
+        if self.exiting:
+            return
         def update_text_stream():
             try:
                 self.response_text.config(state=tk.NORMAL)
@@ -1066,7 +1151,10 @@ class BotGUI:
                 self.response_text.config(state=tk.DISABLED)
             except tk.TclError:
                 pass
-        self.master.after(0, update_text_stream)
+        try:
+            self.master.after(0, update_text_stream)
+        except (tk.TclError, RuntimeError):
+            pass
 
     # =========================================================================
     # 6. ACTION ROUTER / TOOL EXECUTOR
@@ -1169,8 +1257,10 @@ class BotGUI:
             self.tts_thread = threading.Thread(target=self._tts_worker, daemon=True, name="TTSWorkerThread")
             self.tts_thread.start()
             
-            while True:
+            while not self.exiting and not self.stop_event.is_set():
                 trigger_source = self.detect_wake_word_or_ptt()
+                if trigger_source == "EXIT" or self.exiting or self.stop_event.is_set():
+                    break
                 if self.interrupted.is_set():
                     self.interrupted.clear()
                     self.set_state(BotStates.IDLE, "Resetting...")
@@ -1183,12 +1273,16 @@ class BotGUI:
                     audio_file = self.record_voice_ptt()
                 else:
                     audio_file = self.record_voice_adaptive()
-                
+
+                if self.exiting or self.stop_event.is_set():
+                    break
                 if not audio_file:
                     self.set_state(BotStates.IDLE, "Heard nothing.")
                     continue
                 
                 user_text = self.transcribe_audio(audio_file)
+                if self.exiting or self.stop_event.is_set():
+                    break
                 if not user_text:
                     self.set_state(BotStates.IDLE, "Transcription empty.")
                     continue
@@ -1198,19 +1292,21 @@ class BotGUI:
                 self.idle_event.clear()
                 self.chat_and_respond(user_text)
 
+                if self.exiting or self.stop_event.is_set():
+                    break
+
                 # Restart listening trigger unless idle commanded
-                if not self.idle_event.is_set():
+                if not self.idle_event.is_set() and not self.exiting and not self.stop_event.is_set():
                     print("[AUTO] Listening active again...", flush=True)
+                    self._cancel_auto_stop_timer()
+                    self.ptt_auto_stop_duration = 5.0
                     self.recording_active.set()
                     self.ptt_event.set()
-                    def _auto_stop():
-                        time.sleep(5)
-                        self.recording_active.clear()
-                    threading.Thread(target=_auto_stop, daemon=True).start()
                     
         except Exception as e:
-            traceback.print_exc()
-            self.set_state(BotStates.ERROR, f"Fatal Error: {str(e)[:40]}")
+            if not self.exiting and not self.stop_event.is_set():
+                traceback.print_exc()
+                self.set_state(BotStates.ERROR, f"Fatal Error: {str(e)[:40]}")
 
     def warm_up_logic(self):
         self.set_state(BotStates.WARMUP, "Warming up brains...")
@@ -1224,14 +1320,21 @@ class BotGUI:
         print("[INIT] Models loaded & active.", flush=True)
 
     def detect_wake_word_or_ptt(self):
+        if self.exiting or self.stop_event.is_set():
+            return "EXIT"
+        if self.ptt_event.is_set():
+            self.ptt_event.clear()
+            return "PTT"
+
         self.set_state(BotStates.IDLE, "Waiting...")
-        self.ptt_event.clear()
         
         if self.oww_model:
             self.oww_model.reset()
 
         if self.oww_model is None:
             self.ptt_event.wait()
+            if self.exiting or self.stop_event.is_set():
+                return "EXIT"
             self.ptt_event.clear()
             return "PTT"
 
@@ -1258,10 +1361,17 @@ class BotGUI:
         except StopIteration as si:
             return str(si)
         except Exception as e:
+            if self.exiting or self.stop_event.is_set():
+                return "EXIT"
             print(f"[AUDIO] Stream error: {e}. Falling back to PTT.", flush=True)
             self.ptt_event.wait()
+            if self.exiting or self.stop_event.is_set():
+                return "EXIT"
+            self.ptt_event.clear()
             return "PTT"
 
+        if self.exiting or self.stop_event.is_set():
+            return "EXIT"
         return "WAKE"
 
     def _listen_loop(self, stream_args, input_rate, oww_rate, oww_chunk, use_resampling):
@@ -1271,7 +1381,7 @@ class BotGUI:
         MAX_OVERFLOWS = 30
 
         with sd.InputStream(**stream_args) as stream:
-            while True:
+            while not self.exiting and not self.stop_event.is_set():
                 # Polling interrupts
                 if self.ptt_event.is_set():
                     self.ptt_event.clear()
@@ -1285,7 +1395,12 @@ class BotGUI:
                 try:
                     data, overflow = stream.read(stream_args["blocksize"])
                 except Exception as e:
+                    if self.exiting or self.stop_event.is_set():
+                        raise StopIteration("EXIT")
                     raise RuntimeError(f"Stream read failure: {e}")
+
+                if self.exiting or self.stop_event.is_set():
+                    raise StopIteration("EXIT")
 
                 if overflow:
                     overflow_count += 1
@@ -1336,9 +1451,16 @@ class BotGUI:
 
                 print(f"\r[MIC] {level_label} |{bar}| {current_max:5d}{oww_score_str}   ", end="", flush=True)
 
+        if self.exiting or self.stop_event.is_set():
+            raise StopIteration("EXIT")
+
     def record_voice_adaptive(self, filename="input.wav"):
+        if self.exiting or self.stop_event.is_set():
+            return None
         print("Recording (Adaptive)...", flush=True)
         time.sleep(0.5)
+        if self.exiting or self.stop_event.is_set() or self.idle_event.is_set():
+            return None
         samplerate = choose_input_samplerate(INPUT_DEVICE_NAME, CURRENT_CONFIG.get("input_sample_rate"))
 
         silence_threshold = 0.006
@@ -1371,19 +1493,37 @@ class BotGUI:
         try:
             sd.stop()
             time.sleep(0.2)
+            if self.exiting or self.stop_event.is_set() or self.idle_event.is_set():
+                return None
             with sd.InputStream(samplerate=samplerate, channels=1, callback=callback, 
                                 device=INPUT_DEVICE_NAME, blocksize=chunk_size):
-                while not silence_started and recorded_chunks < max_chunks:
+                while (not silence_started and recorded_chunks < max_chunks
+                       and not self.exiting and not self.stop_event.is_set()
+                       and not self.idle_event.is_set()):
                     sd.sleep(int(chunk_duration * 1000))
         except Exception as e:
-            print(f"[AUDIO ERROR] Adaptive recording failed: {e}", flush=True)
+            if not self.exiting and not self.stop_event.is_set():
+                print(f"[AUDIO ERROR] Adaptive recording failed: {e}", flush=True)
             return None
-        
+
+        if self.exiting or self.stop_event.is_set() or self.idle_event.is_set():
+            return None
         return self.save_audio_buffer(buffer, filename, samplerate)
 
     def record_voice_ptt(self, filename="input.wav"):
+        if self.exiting or self.stop_event.is_set():
+            return None
+        duration = self.ptt_auto_stop_duration
+        self.ptt_auto_stop_duration = None
+        if duration is not None and not self.recording_active.is_set():
+            self.recording_active.set()
+
         print("Recording (PTT)...", flush=True)
         time.sleep(0.5)
+        if self.exiting or self.stop_event.is_set() or self.idle_event.is_set():
+            self._cancel_auto_stop_timer()
+            self.recording_active.clear()
+            return None
         samplerate = choose_input_samplerate(INPUT_DEVICE_NAME, CURRENT_CONFIG.get("input_sample_rate"))
         buffer = []
         
@@ -1393,19 +1533,33 @@ class BotGUI:
         try:
             sd.stop()
             time.sleep(0.2)
+            if self.exiting or self.stop_event.is_set() or self.idle_event.is_set():
+                return None
             with sd.InputStream(samplerate=samplerate, channels=1, callback=callback, device=INPUT_DEVICE_NAME):
-                while self.recording_active.is_set():
+                if duration is not None:
+                    self._start_auto_stop_timer(duration)
+                while self.recording_active.is_set() and not self.exiting and not self.stop_event.is_set():
                     sd.sleep(50)
         except Exception as e:
-            print(f"[AUDIO ERROR] PTT recording failed: {e}", flush=True)
+            if not self.exiting and not self.stop_event.is_set():
+                print(f"[AUDIO ERROR] PTT recording failed: {e}", flush=True)
             return None
-            
+        finally:
+            self._cancel_auto_stop_timer()
+            self.recording_active.clear()
+
+        if self.exiting or self.stop_event.is_set():
+            return None
         return self.save_audio_buffer(buffer, filename, samplerate)
 
     def save_audio_buffer(self, buffer, filename, samplerate=16000):
         if not buffer:
             return None
         audio_data = np.concatenate(buffer, axis=0).flatten()
+        min_samples = int(samplerate * 0.1)
+        if len(audio_data) < min_samples:
+            print(f"[AUDIO] Recording too short ({len(audio_data)/samplerate:.2f}s) — skipping.", flush=True)
+            return None
         audio_data = np.nan_to_num(audio_data, nan=0.0, posinf=0.0, neginf=0.0)
         audio_data = (audio_data * 32767).astype(np.int16)
 
@@ -1645,7 +1799,7 @@ class BotGUI:
             time.sleep(0.05)
 
     def _tts_worker(self):
-        while True:
+        while not self.exiting and not self.stop_event.is_set():
             with self.tts_queue_lock:
                 if self.tts_queue:
                     full_text = self.tts_queue.pop(0)
@@ -1762,7 +1916,7 @@ class BotGUI:
                 MAX_GAP_TICKS = 25  # 25 * 20ms = 500ms silence flags end of phrase
 
                 while True:
-                    if self.interrupted.is_set():
+                    if self.interrupted.is_set() or self.exiting or self.stop_event.is_set():
                         break
 
                     if not audio_started and time.time() > pre_audio_deadline:
