@@ -3,7 +3,7 @@ set -e
 
 NEEDS_REBOOT=0
 HAILO_GENAI_DEB_URL="${HAILO_GENAI_DEB_URL:-https://dev-public.hailo.ai/2025_12/Hailo10/hailo_gen_ai_model_zoo_5.1.1_arm64.deb}"
-HAILO_MODEL="${HAILO_MODEL:-qwen2.5:1.5b}"
+HAILO_MODEL="${HAILO_MODEL:-qwen2.5-instruct:1.5b}"
 
 # 1. System & Hardware Dependencies (Raspberry Pi 5 ARM64 + AI HAT+ 2 Hailo-10H)
 sudo apt update

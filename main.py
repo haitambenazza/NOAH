@@ -108,7 +108,7 @@ INPUT_DEVICE_NAME = None
 
 DEFAULT_CONFIG = {
     "ollama_host": "http://localhost:8000",
-    "text_model": "qwen2.5:1.5b",
+    "text_model": "qwen2.5-instruct:1.5b",
     "voice_model": "piper/en_GB-semaine-medium.onnx",
     "chat_memory": True,
     "system_prompt_extras": "",
