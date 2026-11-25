@@ -47,7 +47,7 @@ except ImportError:
     OWW_AVAILABLE = False
     print("[INIT WARNING] openwakeword not installed — Wake Word detection will be disabled.")
 
-import ollama
+import requests
 
 # --- SPEECH TO TEXT ---
 try:
@@ -139,10 +139,88 @@ def load_config():
             print(f"Config Error: {e}. Using defaults.")
     return config
 
+class HailoOllamaClient:
+    """Minimal REST client compatible with hailo-ollama (Oat++ v1.4.0) and standard Ollama."""
+
+    def __init__(self, host="http://localhost:8000", timeout=(10, 120)):
+        self.host = host.rstrip("/")
+        self.timeout = timeout
+        self._supports_options = True
+
+    def _post_json(self, endpoint, payload, stream=False):
+        url = f"{self.host}{endpoint}"
+        resp = requests.post(url, json=payload, stream=stream, timeout=self.timeout)
+        if resp.status_code in (400, 422, 500) and "options" in payload:
+            resp.close()
+            self._supports_options = False
+            print("[LLM] Server rejected 'options' payload; retrying with minimal schema.", flush=True)
+            minimal_payload = {k: v for k, v in payload.items() if k != "options"}
+            resp = requests.post(url, json=minimal_payload, stream=stream, timeout=self.timeout)
+
+        if resp.status_code >= 400:
+            err_body = resp.text[:400]
+            resp.close()
+            raise RuntimeError(f"HTTP {resp.status_code} from {endpoint}: {err_body}")
+        return resp
+
+    def chat(self, model, messages, stream=False, options=None):
+        clean_messages = [
+            {"role": str(m.get("role", "user")), "content": str(m.get("content", ""))}
+            for m in messages
+            if m.get("content") is not None
+        ]
+        payload = {
+            "model": str(model),
+            "messages": clean_messages,
+            "stream": bool(stream),
+        }
+        if options and self._supports_options:
+            payload["options"] = options
+
+        resp = self._post_json("/api/chat", payload, stream=bool(stream))
+        if stream:
+            def _iter_chunks():
+                try:
+                    for line in resp.iter_lines(decode_unicode=True):
+                        if not line:
+                            continue
+                        if isinstance(line, bytes):
+                            line = line.decode("utf-8", errors="ignore")
+                        line = line.strip()
+                        if not line:
+                            continue
+                        yield json.loads(line)
+                finally:
+                    resp.close()
+
+            return _iter_chunks()
+
+        try:
+            return resp.json()
+        finally:
+            resp.close()
+
+    def generate(self, model, prompt="", keep_alive=None, stream=False, options=None):
+        payload = {
+            "model": str(model),
+            "prompt": str(prompt),
+            "stream": bool(stream),
+        }
+        if keep_alive is not None:
+            payload["keep_alive"] = str(keep_alive)
+        if options and self._supports_options:
+            payload["options"] = options
+
+        resp = self._post_json("/api/generate", payload, stream=False)
+        try:
+            return resp.json()
+        finally:
+            resp.close()
+
 CURRENT_CONFIG = load_config()
 TEXT_MODEL = CURRENT_CONFIG["text_model"]
 OLLAMA_HOST = CURRENT_CONFIG.get("ollama_host", "http://localhost:8000")
-OLLAMA_CLIENT = ollama.Client(host=OLLAMA_HOST)
+OLLAMA_CLIENT = HailoOllamaClient(host=OLLAMA_HOST)
 print(f"[LLM] Configured Ollama client: host={OLLAMA_HOST} model={TEXT_MODEL}", flush=True)
 
 # USB microphone keywords for auto-detection
@@ -1805,41 +1883,45 @@ class BotGUI:
             is_action_mode = False
             bot_label_written = False
 
-            for chunk in stream:
-                if self.interrupted.is_set():
-                    break
-                raw = self._extract_ollama_content(chunk)
-                if not raw:
-                    continue
-                content = raw.encode('ascii', 'ignore').decode('ascii')
-                full_response_buffer += content
+            try:
+                for chunk in stream:
+                    if self.interrupted.is_set():
+                        break
+                    raw = self._extract_ollama_content(chunk)
+                    if not raw:
+                        continue
+                    content = raw.encode('ascii', 'ignore').decode('ascii')
+                    full_response_buffer += content
 
-                # Determine action mode based on the first non-whitespace character in the stream
-                stripped = full_response_buffer.lstrip()
-                if stripped and stripped.startswith('{'):
-                    is_action_mode = True
+                    # Determine action mode based on the first non-whitespace character in the stream
+                    stripped = full_response_buffer.lstrip()
+                    if stripped and stripped.startswith('{'):
+                        is_action_mode = True
+                        self.thinking_sound_active.clear()
+                        continue
+
+                    if is_action_mode:
+                        continue
+
                     self.thinking_sound_active.clear()
-                    continue
 
-                if is_action_mode:
-                    continue
+                    if not bot_label_written:
+                        self.append_to_text("BOT: ", newline=False)
+                        bot_label_written = True
 
-                self.thinking_sound_active.clear()
+                    self._stream_to_text(content)
+                    chunk_buffer += content
 
-                if not bot_label_written:
-                    self.append_to_text("BOT: ", newline=False)
-                    bot_label_written = True
-
-                self._stream_to_text(content)
-                chunk_buffer += content
-
-                # Sentence parser to stream to TTS workers early
-                if re.search(r'[.!?\n]', chunk_buffer):
-                    text_sentence = chunk_buffer.encode('ascii', 'ignore').decode('ascii').strip()
-                    if text_sentence and re.search(r'[a-zA-Z0-9]', text_sentence):
-                        with self.tts_queue_lock:
-                            self.tts_queue.append(text_sentence)
-                    chunk_buffer = ""
+                    # Sentence parser to stream to TTS workers early
+                    if re.search(r'[.!?\n]', chunk_buffer):
+                        text_sentence = chunk_buffer.encode('ascii', 'ignore').decode('ascii').strip()
+                        if text_sentence and re.search(r'[a-zA-Z0-9]', text_sentence):
+                            with self.tts_queue_lock:
+                                self.tts_queue.append(text_sentence)
+                        chunk_buffer = ""
+            finally:
+                if hasattr(stream, "close"):
+                    stream.close()
 
             if chunk_buffer.strip():
                 text_sentence = chunk_buffer.encode('ascii', 'ignore').decode('ascii').strip()
