@@ -176,6 +176,64 @@ class HailoOllamaClient:
             raise RuntimeError(f"HTTP {resp.status_code} from {endpoint}: {err_body}")
         return resp
 
+    @staticmethod
+    def _extract_model_names(data):
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            items = data.get("models") or data.get("data") or []
+        else:
+            return []
+        names = []
+        for item in items:
+            if isinstance(item, str) and item.strip():
+                names.append(item.strip())
+            elif isinstance(item, dict):
+                name = item.get("name") or item.get("model")
+                if isinstance(name, str) and name.strip():
+                    names.append(name.strip())
+        return names
+
+    def list_installed_models(self):
+        try:
+            resp = requests.get(f"{self.host}/api/tags", timeout=5)
+            try:
+                if resp.status_code >= 400:
+                    return []
+                return self._extract_model_names(resp.json())
+            finally:
+                resp.close()
+        except Exception:
+            return []
+
+    def list_available_models(self):
+        try:
+            resp = requests.get(f"{self.host}/hailo/v1/list", timeout=5)
+            try:
+                if resp.status_code >= 400:
+                    return []
+                return self._extract_model_names(resp.json())
+            finally:
+                resp.close()
+        except Exception:
+            return []
+
+    def pull(self, model):
+        resp = requests.post(
+            f"{self.host}/api/pull",
+            json={"model": str(model), "stream": False},
+            timeout=(10, 600),
+        )
+        try:
+            if resp.status_code >= 400:
+                raise RuntimeError(f"HTTP {resp.status_code} from /api/pull: {resp.text[:400]}")
+            data = resp.json()
+            if isinstance(data, dict) and data.get("error"):
+                raise RuntimeError(f"LLM server error: {data['error']}")
+            return data
+        finally:
+            resp.close()
+
     def chat(self, model, messages, stream=False, options=None):
         clean_messages = [
             {"role": str(m.get("role", "user")), "content": str(m.get("content", ""))}
@@ -212,16 +270,23 @@ class HailoOllamaClient:
                             if not line or line == "[DONE]":
                                 continue
                         try:
-                            yield json.loads(line)
+                            obj = json.loads(line)
                         except json.JSONDecodeError as je:
                             print(f"[LLM WARNING] Non-JSON stream line ({je}): {line[:120]!r}", flush=True)
+                            continue
+                        if isinstance(obj, dict) and obj.get("error"):
+                            raise RuntimeError(f"LLM server error: {obj['error']}")
+                        yield obj
                 finally:
                     resp.close()
 
             return _iter_chunks()
 
         try:
-            return resp.json()
+            data = resp.json()
+            if isinstance(data, dict) and data.get("error"):
+                raise RuntimeError(f"LLM server error: {data['error']}")
+            return data
         finally:
             resp.close()
 
@@ -238,7 +303,10 @@ class HailoOllamaClient:
 
         resp = self._post_json("/api/generate", payload, stream=False)
         try:
-            return resp.json()
+            data = resp.json()
+            if isinstance(data, dict) and data.get("error"):
+                raise RuntimeError(f"LLM server error: {data['error']}")
+            return data
         finally:
             resp.close()
 
@@ -1436,7 +1504,29 @@ class BotGUI:
                 self.set_state(BotStates.ERROR, f"Fatal Error: {str(e)[:40]}")
 
     def warm_up_logic(self):
+        global TEXT_MODEL
         self.set_state(BotStates.WARMUP, "Warming up brains...")
+
+        installed = OLLAMA_CLIENT.list_installed_models()
+        if installed and TEXT_MODEL not in installed:
+            base_prefix = TEXT_MODEL.split(":")[0]
+            chosen = next((m for m in installed if m.startswith(base_prefix)), installed[0])
+            print(f"[LLM] Configured model '{TEXT_MODEL}' not installed; using '{chosen}' from /api/tags ({installed})", flush=True)
+            TEXT_MODEL = chosen
+        elif not installed:
+            available = OLLAMA_CLIENT.list_available_models()
+            if TEXT_MODEL in available:
+                target = TEXT_MODEL
+            else:
+                target = next((m for m in available if "qwen2.5" in m), available[0] if available else TEXT_MODEL)
+            print(f"[LLM] No models installed in hailo-ollama — pulling '{target}'...", flush=True)
+            try:
+                OLLAMA_CLIENT.pull(target)
+                TEXT_MODEL = target
+                print(f"[LLM] Pulled '{target}' successfully.", flush=True)
+            except Exception as pull_err:
+                print(f"[LLM WARNING] Failed pulling '{target}': {pull_err}", flush=True)
+
         try:
             # Tell Ollama/hailo-ollama to load model into NPU memory
             OLLAMA_CLIENT.generate(model=TEXT_MODEL, prompt="", keep_alive=-1)
