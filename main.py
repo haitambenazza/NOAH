@@ -21,6 +21,7 @@ import datetime
 import warnings
 import wave
 import queue
+from collections import deque
 
 # Tune CPU thread pools for Pi 5 (now that LLM runs on Hailo-10H NPU)
 # and cap Hugging Face Hub timeouts so Whisper doesn't stall on Wi-Fi/DNS.
@@ -32,6 +33,7 @@ os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "30")
 
 # Suppress harmless library warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="duckduckgo_search")
+warnings.filterwarnings("ignore", category=RuntimeWarning, module="ddgs")
 
 # Core audio & numerical dependencies
 import sounddevice as sd
@@ -45,7 +47,7 @@ try:
     OWW_AVAILABLE = True
 except ImportError:
     OWW_AVAILABLE = False
-    print("[INIT WARNING] openwakeword not installed — Wake Word detection will be disabled.")
+    print("[INIT INFO] openwakeword not installed — using Whisper wake word detection.")
 
 import requests
 
@@ -59,11 +61,15 @@ except ImportError:
 
 # --- WEB SEARCH ---
 try:
-    from duckduckgo_search import DDGS
+    from ddgs import DDGS
     DDGS_AVAILABLE = True
 except ImportError:
-    DDGS_AVAILABLE = False
-    print("[INIT WARNING] duckduckgo-search not installed — Web search action will be disabled.")
+    try:
+        from duckduckgo_search import DDGS
+        DDGS_AVAILABLE = True
+    except ImportError:
+        DDGS_AVAILABLE = False
+        print("[INIT WARNING] ddgs/duckduckgo-search not installed — Web search action will be disabled.")
 
 # --- COMPUTER VISION ---
 os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
@@ -88,6 +94,11 @@ except Exception as _picam_err:
     print(f"[INIT INFO] picamera2 unavailable ({_picam_err}) — Will fall back to OpenCV VideoCapture.")
 
 try:
+    from libcamera import Transform as LibcameraTransform
+except Exception:
+    LibcameraTransform = None
+
+try:
     from gpiozero import Servo
     GPIO_AVAILABLE = True
 except ImportError:
@@ -98,10 +109,22 @@ except ImportError:
 # 1. CONFIGURATION & CONSTANTS
 # =========================================================================
 
-CONFIG_FILE = "config.json"
-MEMORY_FILE = "memory.json"
-WAKE_WORD_MODEL = "./wakeword.onnx"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+IS_TTY = bool(getattr(sys.stdout, "isatty", lambda: False)())
+
+
+def _resolve_path(path):
+    """Resolves relative paths against the script directory rather than cwd."""
+    if not path or os.path.isabs(path):
+        return path
+    return os.path.join(BASE_DIR, path)
+
+
+CONFIG_FILE = _resolve_path("config.json")
+MEMORY_FILE = _resolve_path("memory.json")
+WAKE_WORD_MODEL = _resolve_path("wakeword.onnx")
 WAKE_WORD_THRESHOLD = 0.3
+DEFAULT_WAKE_WORDS = ["hey noah", "wake up", "get up"]
 
 # HARDWARE SETTINGS
 INPUT_DEVICE_NAME = None
@@ -110,6 +133,8 @@ DEFAULT_CONFIG = {
     "ollama_host": "http://localhost:8000",
     "text_model": "qwen2.5-instruct:1.5b",
     "voice_model": "piper/en_GB-semaine-medium.onnx",
+    "wake_word_engine": "whisper",
+    "wake_words": list(DEFAULT_WAKE_WORDS),
     "chat_memory": True,
     "system_prompt_extras": "",
     "input_device": None,
@@ -121,7 +146,10 @@ DEFAULT_CONFIG = {
     "servo_gpio2": 13,
     "camera_width": 640,
     "camera_height": 480,
-    "camera_fps": 15
+    "camera_fps": 15,
+    "camera_flip": True,
+    "use_yunet": True,
+    "debug_save_wav": False,
 }
 
 # LLM SETTINGS (Hailo-10H NPU via hailo-ollama)
@@ -153,6 +181,92 @@ def _highpass_filter(samples_float32, samplerate, cutoff_hz=150.0):
     except Exception:
         return samples_float32
 
+def _normalize_wake_words(wake_words):
+    """Returns a cleaned list of lowercase punctuation-stripped wake phrases."""
+    if not isinstance(wake_words, (list, tuple, set)):
+        return list(DEFAULT_WAKE_WORDS)
+    cleaned = []
+    seen = set()
+    for item in wake_words:
+        if not isinstance(item, str):
+            continue
+        stripped = re.sub(r"[^a-z0-9'\s]", " ", item.lower())
+        norm = " ".join(stripped.split())
+        if norm and norm not in seen:
+            cleaned.append(norm)
+            seen.add(norm)
+    return cleaned if cleaned else list(DEFAULT_WAKE_WORDS)
+
+def _format_wake_prompt(wake_words):
+    """Formats wake phrases into a Whisper prompt hint."""
+    phrases = _normalize_wake_words(wake_words)
+    formatted = []
+    for phrase in phrases:
+        words = phrase.split()
+        titled = []
+        for idx, word in enumerate(words):
+            if word == "noah":
+                titled.append("Noah")
+            elif word == "bmo":
+                titled.append("BMO")
+            elif idx == 0:
+                titled.append(word.capitalize())
+            else:
+                titled.append(word)
+        formatted.append(" ".join(titled))
+    return ". ".join(formatted) + "."
+
+def _build_wake_patterns(wake_words):
+    """Builds compiled regex patterns (and safe phonetic aliases) for wake phrases."""
+    patterns = []
+    for phrase in _normalize_wake_words(wake_words):
+        words = phrase.split()
+        exact_pat = r"\b" + r"\s+".join(re.escape(w) for w in words) + r"\b"
+        patterns.append((phrase, re.compile(exact_pat, re.IGNORECASE)))
+        if phrase == "hey noah":
+            for alias_pat in (
+                r"\bhey\s+noa+h?\b",
+                r"\bhey\s+noer\b",
+                r"\bhey\s+know\s+a\b",
+            ):
+                patterns.append((phrase, re.compile(alias_pat, re.IGNORECASE)))
+    return patterns
+
+def _match_wake_phrase(text, wake_patterns):
+    """Matches a wake phrase and extracts any trailing spoken command."""
+    if not text or not wake_patterns:
+        return (None, "")
+    normalized = " ".join(re.sub(r"[^a-z0-9'\s]", " ", text.lower()).split())
+    if not normalized:
+        return (None, "")
+
+    best_phrase = None
+    best_match = None
+    for phrase, pattern in wake_patterns:
+        match = pattern.search(normalized)
+        if match is None:
+            continue
+        if (
+            best_match is None
+            or match.start() < best_match.start()
+            or (match.start() == best_match.start() and match.end() > best_match.end())
+        ):
+            best_phrase = phrase
+            best_match = match
+
+    if best_match is None:
+        return (None, "")
+
+    trailing = normalized[best_match.end():].strip()
+    trailing = re.sub(r"^(?:noah|noa)\b[\s,]*", "", trailing).strip()
+    filler_words = {
+        "noah", "noa", "bmo", "please", "now",
+        "already", "buddy", "robot", "um", "uh", "so",
+    }
+    if not trailing or trailing in filler_words or (" " not in trailing and len(trailing) < 4):
+        trailing = ""
+    return (best_phrase, trailing)
+
 class HailoOllamaClient:
     """Minimal REST client compatible with hailo-ollama (Oat++ v1.4.0) and standard Ollama."""
 
@@ -160,16 +274,25 @@ class HailoOllamaClient:
         self.host = host.rstrip("/")
         self.timeout = timeout
         self._supports_options = True
+        self.session = requests.Session()
 
-    def _post_json(self, endpoint, payload, stream=False):
+    def close(self):
+        try:
+            self.session.close()
+        except Exception:
+            pass
+
+    def _post_json(self, endpoint, payload, stream=False, timeout=None):
         url = f"{self.host}{endpoint}"
-        resp = requests.post(url, json=payload, stream=stream, timeout=self.timeout)
-        if resp.status_code in (400, 422, 500) and "options" in payload:
+        req_timeout = self.timeout if timeout is None else timeout
+        resp = self.session.post(url, json=payload, stream=stream, timeout=req_timeout)
+        if resp.status_code in (400, 422) and "options" in payload:
             resp.close()
-            self._supports_options = False
             print("[LLM] Server rejected 'options' payload; retrying with minimal schema.", flush=True)
             minimal_payload = {k: v for k, v in payload.items() if k != "options"}
-            resp = requests.post(url, json=minimal_payload, stream=stream, timeout=self.timeout)
+            resp = self.session.post(url, json=minimal_payload, stream=stream, timeout=req_timeout)
+            if resp.status_code < 400:
+                self._supports_options = False
 
         if resp.status_code >= 400:
             err_body = resp.text[:400]
@@ -197,7 +320,7 @@ class HailoOllamaClient:
 
     def list_installed_models(self):
         try:
-            resp = requests.get(f"{self.host}/api/tags", timeout=5)
+            resp = self.session.get(f"{self.host}/api/tags", timeout=5)
             try:
                 if resp.status_code >= 400:
                     return []
@@ -209,7 +332,7 @@ class HailoOllamaClient:
 
     def list_available_models(self):
         try:
-            resp = requests.get(f"{self.host}/hailo/v1/list", timeout=5)
+            resp = self.session.get(f"{self.host}/hailo/v1/list", timeout=5)
             try:
                 if resp.status_code >= 400:
                     return []
@@ -220,7 +343,7 @@ class HailoOllamaClient:
             return []
 
     def pull(self, model):
-        resp = requests.post(
+        resp = self.session.post(
             f"{self.host}/api/pull",
             json={"model": str(model), "stream": False},
             timeout=(10, 600),
@@ -258,7 +381,7 @@ class HailoOllamaClient:
         if stream:
             def _iter_chunks():
                 try:
-                    for line in resp.iter_lines(chunk_size=1, decode_unicode=True):
+                    for line in resp.iter_lines(chunk_size=512, decode_unicode=True):
                         if not line:
                             continue
                         if isinstance(line, bytes):
@@ -291,7 +414,7 @@ class HailoOllamaClient:
         finally:
             resp.close()
 
-    def generate(self, model, prompt="", keep_alive=None, stream=False, options=None):
+    def generate(self, model, prompt="", keep_alive=None, stream=False, options=None, timeout=None):
         payload = {
             "model": str(model),
             "prompt": str(prompt),
@@ -302,7 +425,7 @@ class HailoOllamaClient:
         if options and self._supports_options:
             payload["options"] = options
 
-        resp = self._post_json("/api/generate", payload, stream=False)
+        resp = self._post_json("/api/generate", payload, stream=False, timeout=timeout)
         try:
             data = resp.json()
             if isinstance(data, dict) and data.get("error"):
@@ -438,10 +561,10 @@ You: {"action": "search_web", "value": "robots news"}
 SYSTEM_PROMPT = BASE_SYSTEM_PROMPT + "\n\n" + CURRENT_CONFIG.get("system_prompt_extras", "")
 
 # Sound Directories
-greeting_sounds_dir = "sounds/greeting_sounds"
-ack_sounds_dir = "sounds/ack_sounds"
-thinking_sounds_dir = "sounds/thinking_sounds"
-error_sounds_dir = "sounds/error_sounds"
+greeting_sounds_dir = _resolve_path("sounds/greeting_sounds")
+ack_sounds_dir = _resolve_path("sounds/ack_sounds")
+thinking_sounds_dir = _resolve_path("sounds/thinking_sounds")
+error_sounds_dir = _resolve_path("sounds/error_sounds")
 
 # =========================================================================
 # 2. HARDWARE INTERFACING & FALLBACKS
@@ -478,6 +601,7 @@ class MotorController:
         self.max_pwm = max_pwm
         self.servo1 = None
         self.servo2 = None
+        self._stopped = True
         self.queue = queue.Queue(maxsize=10)
         self.thread = None
         self.running = False
@@ -510,16 +634,21 @@ class MotorController:
             try:
                 self.queue.put(('exit',), timeout=0.1)
                 self.thread.join(timeout=1.0)
-            except:
+            except Exception:
                 pass
         self.stop_robot()
 
     def stop_robot(self):
         try:
-            if self.servo1 and (self.servo1.value is not None or self.servo1.value != 0):
+            s1_none = (self.servo1 is None or self.servo1.value is None)
+            s2_none = (self.servo2 is None or self.servo2.value is None)
+            if self._stopped and s1_none and s2_none:
+                return
+            if self.servo1 and self.servo1.value is not None:
                 self.servo1.value = None
-            if self.servo2 and (self.servo2.value is not None or self.servo2.value != 0):
+            if self.servo2 and self.servo2.value is not None:
                 self.servo2.value = None
+            self._stopped = True
         except Exception as e:
             print(f"[MOTOR ERROR] Failed to stop servos: {e}", flush=True)
 
@@ -541,13 +670,17 @@ class MotorController:
             try:
                 # Get the command, timeout allows checks of self.running
                 cmd = self.queue.get(timeout=0.1)
-                
-                # Dynamic optimization: Drain the queue to only execute the latest command
-                while not self.queue.empty():
-                    try:
-                        cmd = self.queue.get_nowait()
-                    except queue.Empty:
-                        break
+
+                # Drain stale motion commands while never dropping an exit command
+                if cmd[0] != 'exit':
+                    while not self.queue.empty():
+                        try:
+                            next_cmd = self.queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        cmd = next_cmd
+                        if cmd[0] == 'exit':
+                            break
 
                 action = cmd[0]
                 if action == 'exit':
@@ -569,11 +702,11 @@ class MotorController:
         """
         deadzone = 0.25         # Ignore small errors to prevent servo jitter
         base_track_speed = 0.6  # Maximum turning speed cap
-        
+
         if abs(error_x) > deadzone:
             speed = base_track_speed * abs(error_x)
             speed = max(0.15, min(speed, base_track_speed))
-            
+
             if error_x > 0:
                 # Target is to the RIGHT -> Turn Right
                 self.servo1.value = speed
@@ -582,6 +715,7 @@ class MotorController:
                 # Target is to the LEFT -> Turn Left
                 self.servo1.value = -speed
                 self.servo2.value = -speed
+            self._stopped = False
         else:
             self.stop_robot()
 
@@ -591,13 +725,13 @@ class MotorController:
 
 class ObjectDetector:
     def __init__(self):
-        self.model_dir = "models"
+        self.model_dir = _resolve_path("models")
         self.proto_url = "https://raw.githubusercontent.com/chuanqi305/MobileNet-SSD/master/deploy.prototxt"
         self.model_url = "https://github.com/chuanqi305/MobileNet-SSD/raw/master/mobilenet_iter_73000.caffemodel"
-        
+
         self.proto_path = os.path.join(self.model_dir, "deploy.prototxt")
         self.model_path = os.path.join(self.model_dir, "mobilenet_iter_73000.caffemodel")
-        
+
         self.classes = ["background", "aeroplane", "bicycle", "bird", "boat",
                         "bottle", "bus", "car", "cat", "chair", "cow", "diningtable",
                         "dog", "horse", "motorbike", "person", "pottedplant", "sheep",
@@ -617,8 +751,10 @@ class ObjectDetector:
                     print(f"[VISION] Downloading {label}: {url}...", flush=True)
                     r = requests.get(url, timeout=20)
                     r.raise_for_status()
-                    with open(path, "wb") as f:
+                    tmp_path = path + ".tmp"
+                    with open(tmp_path, "wb") as f:
                         f.write(r.content)
+                    os.replace(tmp_path, path)
             if CV2_AVAILABLE:
                 self.net = cv2.dnn.readNetFromCaffe(self.proto_path, self.model_path)
                 self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
@@ -657,43 +793,87 @@ class CameraPipeline:
     Manages camera device streams (Picamera2 or OpenCV fallback) in a separate thread.
     Downscales frames for low-CPU face detection and feeds offsets to MotorController.
     """
-    def __init__(self, motor_controller, width=640, height=480, fps=15):
+    YUNET_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
+
+    def __init__(self, motor_controller, width=640, height=480, fps=15, camera_flip=True, use_yunet=True):
         self.motor_controller = motor_controller
-        self.width = width
-        self.height = height
-        self.fps = fps
+        self.width = int(width)
+        self.height = int(height)
+        self.fps = max(1, int(fps))
+        self.camera_flip = bool(camera_flip)
+        self.use_yunet = bool(use_yunet)
         self.running = False
         self.thread = None
-        
+
         self.face_detection_enabled = True
         self.preview_enabled = False
         self.preview_callback = None  # Receives RGB image when preview is active
         self.latest_frame = None
-        
+        self._frame_lock = threading.Lock()
+
         self.cap = None
         self.picam = None
-        
-        # Cascade classifier for face detection
+        self._picam_isp_ready = False
+        self._picam_needs_sw_flip = False
+
+        # Face detectors (YuNet preferred when available, Haar Cascade fallback)
+        self.yunet = None
         self.face_cascade = None
         self.init_cascade()
+
+    def get_latest_frame(self):
+        with self._frame_lock:
+            return None if self.latest_frame is None else self.latest_frame.copy()
 
     def init_cascade(self):
         if not CV2_AVAILABLE:
             return
+        if self.use_yunet and hasattr(cv2, "FaceDetectorYN"):
+            yunet_path = _resolve_path("models/face_detection_yunet_2023mar.onnx")
+            if not os.path.exists(yunet_path):
+                try:
+                    os.makedirs(os.path.dirname(yunet_path), exist_ok=True)
+                    print("[CAMERA] Downloading YuNet face detector...", flush=True)
+                    r = requests.get(self.YUNET_URL, timeout=(3, 6))
+                    r.raise_for_status()
+                    tmp_path = yunet_path + ".tmp"
+                    with open(tmp_path, "wb") as f:
+                        f.write(r.content)
+                    os.replace(tmp_path, yunet_path)
+                except Exception as e:
+                    print(f"[CAMERA INFO] YuNet unavailable offline ({e}) — using Haar cascade.", flush=True)
+            if os.path.exists(yunet_path):
+                try:
+                    self.yunet = cv2.FaceDetectorYN.create(
+                        yunet_path,
+                        "",
+                        (max(1, self.width // 2), max(1, self.height // 2)),
+                        0.6,
+                        0.3,
+                        5000,
+                    )
+                    print(f"[CAMERA] Loaded YuNet face detector from: {yunet_path}", flush=True)
+                except Exception as e:
+                    print(f"[CAMERA WARNING] Failed loading YuNet ({e}) — falling back to Haar.", flush=True)
+                    self.yunet = None
+
         cascade_paths = [
-            'haarcascade_frontalface_default.xml',
-            os.path.join(os.path.dirname(cv2.__file__), 'data', 'haarcascade_frontalface_default.xml')
+            _resolve_path('haarcascade_frontalface_default.xml'),
+            _resolve_path('tools/haarcascade_frontalface_default.xml'),
+            os.path.join(os.path.dirname(cv2.__file__), 'data', 'haarcascade_frontalface_default.xml'),
         ]
         for path in cascade_paths:
             if os.path.exists(path):
                 try:
-                    self.face_cascade = cv2.CascadeClassifier(path)
-                    print(f"[CAMERA] Loaded cascade classifier from: {path}", flush=True)
-                    break
+                    cascade = cv2.CascadeClassifier(path)
+                    if not cascade.empty():
+                        self.face_cascade = cascade
+                        print(f"[CAMERA] Loaded cascade classifier from: {path}", flush=True)
+                        break
                 except Exception as e:
                     print(f"[CAMERA ERROR] Error loading cascade from {path}: {e}", flush=True)
-        if not self.face_cascade:
-            print("[CAMERA WARNING] No face cascade classifier loaded. Face tracking will be disabled.", flush=True)
+        if self.yunet is None and self.face_cascade is None:
+            print("[CAMERA WARNING] No face detector loaded. Face tracking will be disabled.", flush=True)
 
     def start(self):
         self.running = True
@@ -744,12 +924,39 @@ class CameraPipeline:
                 cam_info = Picamera2.global_camera_info()
                 if cam_info:
                     self.picam = Picamera2()
-                    config = self.picam.create_preview_configuration(
-                        main={"size": (1640, 1232), "format": "BGR888"}
-                    )
-                    self.picam.configure(config)
-                    self.picam.start()
-                    print(f"[CAMERA] Initialized Picamera2 (1640x1232 binned at {self.fps} FPS).", flush=True)
+                    use_hw_flip = bool(self.camera_flip and LibcameraTransform is not None)
+                    transform = LibcameraTransform(hflip=1, vflip=1) if use_hw_flip else None
+                    isp_candidates = [
+                        {"main": {"size": (self.width, self.height), "format": "RGB888"}, "raw": {"size": (1640, 1232)}},
+                        {"main": {"size": (self.width, self.height), "format": "RGB888"}},
+                    ]
+                    configured = False
+                    for cfg_kwargs in isp_candidates:
+                        try:
+                            if transform is not None:
+                                cfg_kwargs["transform"] = transform
+                            config = self.picam.create_preview_configuration(**cfg_kwargs)
+                            self.picam.configure(config)
+                            self.picam.start()
+                            self._picam_isp_ready = True
+                            self._picam_needs_sw_flip = bool(self.camera_flip and not use_hw_flip)
+                            configured = True
+                            print(
+                                f"[CAMERA] Initialized Picamera2 ISP ({self.width}x{self.height} BGR at {self.fps} FPS, hw_flip={use_hw_flip}).",
+                                flush=True,
+                            )
+                            break
+                        except Exception:
+                            continue
+                    if not configured:
+                        config = self.picam.create_preview_configuration(
+                            main={"size": (1640, 1232), "format": "BGR888"}
+                        )
+                        self.picam.configure(config)
+                        self.picam.start()
+                        self._picam_isp_ready = False
+                        self._picam_needs_sw_flip = self.camera_flip
+                        print(f"[CAMERA] Initialized Picamera2 legacy mode (1640x1232 at {self.fps} FPS).", flush=True)
                     return True
                 else:
                     print("[CAMERA INFO] Picamera2 found 0 CSI cameras connected. Falling back to OpenCV.", flush=True)
@@ -776,7 +983,7 @@ class CameraPipeline:
                             cap.release()
                 except Exception as ex:
                     print(f"[CAMERA INFO] Failed opening camera index {idx}: {ex}", flush=True)
-        
+
         print("[CAMERA INFO] No active CSI or USB camera detected — continuing without camera.", flush=True)
         return False
 
@@ -785,16 +992,42 @@ class CameraPipeline:
             try:
                 self.picam.stop()
                 self.picam.close()
-            except:
+            except Exception:
                 pass
             self.picam = None
         if self.cap:
             try:
                 self.cap.release()
-            except:
+            except Exception:
                 pass
             self.cap = None
         print("[CAMERA] Camera hardware released.", flush=True)
+
+    def _detect_faces(self, frame):
+        """Detects faces using YuNet (preferred) or Haar Cascade fallback."""
+        faces = []
+        if self.yunet is not None:
+            scale = 2
+            small_w = max(1, frame.shape[1] // scale)
+            small_h = max(1, frame.shape[0] // scale)
+            small_bgr = cv2.resize(frame, (small_w, small_h))
+            self.yunet.setInputSize((small_w, small_h))
+            _, raw_faces = self.yunet.detect(small_bgr)
+            if raw_faces is not None:
+                for row in raw_faces:
+                    x, y, w, h = (int(row[0] * scale), int(row[1] * scale), int(row[2] * scale), int(row[3] * scale))
+                    if w > 0 and h > 0:
+                        faces.append((x, y, w, h))
+            return faces
+
+        if self.face_cascade is not None:
+            scale = 4
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            small_gray = cv2.resize(gray, (0, 0), fx=(1.0 / scale), fy=(1.0 / scale))
+            detected = self.face_cascade.detectMultiScale(small_gray, scaleFactor=1.1, minNeighbors=5)
+            for (x, y, w, h) in detected:
+                faces.append((int(x * scale), int(y * scale), int(w * scale), int(h * scale)))
+        return faces
 
     def _run_loop(self):
         if not self._init_camera():
@@ -803,20 +1036,28 @@ class CameraPipeline:
             return
 
         frame_delay = 1.0 / self.fps
-        last_face_time = 0
+        last_face_time = 0.0
         face_lost_delay = 0.5  # Settle time before stopping motors when losing target
+        motors_moving = False
 
         while self.running:
             start_time = time.time()
             frame = None
-            
+
             try:
                 if self.picam:
                     frame_array = self.picam.capture_array()
-                    # Convert RGB (Picamera2 standard) to BGR for OpenCV processing
-                    frame_raw = cv2.cvtColor(frame_array, cv2.COLOR_RGB2BGR)
-                    frame_raw = cv2.flip(frame_raw, -1)  # Flip if mounted upside down
-                    frame = cv2.resize(frame_raw, (self.width, self.height))
+                    if self._picam_isp_ready:
+                        frame = frame_array
+                        if self._picam_needs_sw_flip:
+                            frame = cv2.flip(frame, -1)
+                        if frame.shape[1] != self.width or frame.shape[0] != self.height:
+                            frame = cv2.resize(frame, (self.width, self.height))
+                    else:
+                        frame_raw = cv2.cvtColor(frame_array, cv2.COLOR_RGB2BGR)
+                        if self._picam_needs_sw_flip:
+                            frame_raw = cv2.flip(frame_raw, -1)
+                        frame = cv2.resize(frame_raw, (self.width, self.height))
                 elif self.cap:
                     ret, frame = self.cap.read()
                     if not ret or frame is None:
@@ -832,52 +1073,41 @@ class CameraPipeline:
                 time.sleep(0.01)
                 continue
 
-            self.latest_frame = frame
+            # Keep latest_frame unmutated for downstream object detection
+            with self._frame_lock:
+                self.latest_frame = frame
 
-            # Process frame
-            face_detected = False
-            error_x = 0.0
-
-            if self.face_detection_enabled and self.face_cascade is not None:
-                # Downscale 4x to minimize CPU calculations
-                scale_factor = 4
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                small_gray = cv2.resize(gray, (0, 0), fx=(1.0 / scale_factor), fy=(1.0 / scale_factor))
-                
-                faces = self.face_cascade.detectMultiScale(small_gray, scaleFactor=1.1, minNeighbors=5)
-                
-                if len(faces) > 0:
-                    # Target the first face found to avoid target jittering
-                    (x, y, w, h) = faces[0]
-                    # Scale bounding box back up for display
-                    x, y, w, h = x * scale_factor, y * scale_factor, w * scale_factor, h * scale_factor
+            best_face = None
+            if self.face_detection_enabled and (self.yunet is not None or self.face_cascade is not None):
+                faces = self._detect_faces(frame)
+                if faces:
+                    best_face = max(faces, key=lambda r: r[2] * r[3])
+                    x, y, w, h = best_face
                     face_center_x = x + (w // 2)
-                    face_detected = True
                     last_face_time = time.time()
-                    
-                    # Normalize deviation to range [-1.0, 1.0]
-                    error_x = (face_center_x - (self.width // 2)) / (self.width // 2)
-                    self.motor_controller.set_move(error_x)
-                    
-                    if self.preview_enabled:
-                        # Blue bounding box
-                        cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
-                        # Red center point tracking dot
-                        cv2.circle(frame, (face_center_x, y + (h // 2)), 5, (0, 0, 255), -1)
 
-            if not face_detected:
-                # If no faces are seen, wait for the lost delay before cutting servo speeds
+                    frame_half_w = max(1, frame.shape[1] // 2)
+                    error_x = (face_center_x - frame_half_w) / frame_half_w
+                    self.motor_controller.set_move(error_x)
+                    motors_moving = True
+
+            if best_face is None and motors_moving:
                 if time.time() - last_face_time > face_lost_delay:
                     self.motor_controller.trigger_stop()
+                    motors_moving = False
 
-            # Render overlay if Picture-in-Picture display is toggled on in GUI
+            # Render overlay onto a separate copy if Picture-in-Picture preview is enabled
             if self.preview_enabled and self.preview_callback:
-                # Green center crosshair
-                cv2.line(frame, ((self.width // 2) - 20, self.height // 2), ((self.width // 2) + 20, self.height // 2), (0, 255, 0), 2)
-                cv2.line(frame, (self.width // 2, (self.height // 2) - 20), (self.width // 2, (self.height // 2) + 20), (0, 255, 0), 2)
-                
-                # Convert BGR to RGB for PIL integration
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                preview_frame = frame.copy()
+                h_px, w_px = preview_frame.shape[:2]
+                if best_face is not None:
+                    fx, fy, fw, fh = best_face
+                    cv2.rectangle(preview_frame, (fx, fy), (fx + fw, fy + fh), (255, 0, 0), 2)
+                    cv2.circle(preview_frame, (fx + (fw // 2), fy + (fh // 2)), 5, (0, 0, 255), -1)
+                cv2.line(preview_frame, ((w_px // 2) - 20, h_px // 2), ((w_px // 2) + 20, h_px // 2), (0, 255, 0), 2)
+                cv2.line(preview_frame, (w_px // 2, (h_px // 2) - 20), (w_px // 2, (h_px // 2) + 20), (0, 255, 0), 2)
+
+                frame_rgb = cv2.cvtColor(preview_frame, cv2.COLOR_BGR2RGB)
                 self.preview_callback(frame_rgb)
 
             # Sleep to match targeted framerate
@@ -913,8 +1143,10 @@ class BotGUI:
         
         self.permanent_memory = self.load_chat_history()
         self.session_memory = []
+        self.chat_memory_enabled = bool(CURRENT_CONFIG.get("chat_memory", True))
         self.thinking_sound_active = threading.Event()
-        
+        self._thinking_thread = None
+
         self.last_ptt_time = 0
         self.last_wake_time = 0
         self._auto_stop_timer = None
@@ -925,9 +1157,12 @@ class BotGUI:
         self.recording_active = threading.Event()
         self.interrupted = threading.Event()
         self.stop_event = threading.Event()
-        
-        self.tts_queue = []
+
+        self.tts_queue = deque()
         self.tts_queue_lock = threading.Lock()
+        self.tts_cond = threading.Condition(self.tts_queue_lock)
+        self._audio_out_lock = threading.Lock()
+        self._sfx_abort = threading.Event()
         self.tts_thread = None
         self.agent_thread = None
         self.tts_active = threading.Event()
@@ -936,7 +1171,8 @@ class BotGUI:
         self._auto_followup = False
         self._last_assistant_reply_norm = ""
         self._last_user_text_norm = ""
-        self.current_audio_process = None
+        self._ambient_noise_floor = 0.008
+        self._cam_preview_pending = False
         self.motor_controller = None
         self.camera_pipeline = None
         self.exiting = False
@@ -954,27 +1190,36 @@ class BotGUI:
             motor_controller=self.motor_controller,
             width=CURRENT_CONFIG.get("camera_width", 640),
             height=CURRENT_CONFIG.get("camera_height", 480),
-            fps=CURRENT_CONFIG.get("camera_fps", 15)
+            fps=CURRENT_CONFIG.get("camera_fps", 15),
+            camera_flip=CURRENT_CONFIG.get("camera_flip", True),
+            use_yunet=CURRENT_CONFIG.get("use_yunet", True),
         )
         self.camera_pipeline.start()
 
         # --- WAKE WORD INITIALIZATION ---
         print("[INIT] Loading Wake Word...", flush=True)
+        self.wake_word_engine = str(CURRENT_CONFIG.get("wake_word_engine", "whisper")).strip().lower()
+        self.wake_words = _normalize_wake_words(CURRENT_CONFIG.get("wake_words", DEFAULT_WAKE_WORDS))
+        self._wake_patterns = _build_wake_patterns(self.wake_words)
+        self._pending_wake_command = ""
         self.oww_model = None
-        if OWW_AVAILABLE and os.path.exists(WAKE_WORD_MODEL):
-            try:
-                self.oww_model = Model(wakeword_models=[WAKE_WORD_MODEL], inference_framework="onnx")
-                print("[INIT] Wake Word Loaded (ONNX).", flush=True)
-            except TypeError:
+        if self.wake_word_engine == "openwakeword":
+            if OWW_AVAILABLE and os.path.exists(WAKE_WORD_MODEL):
                 try:
-                    self.oww_model = Model(wakeword_model_paths=[WAKE_WORD_MODEL])
-                    print("[INIT] Wake Word Loaded (Legacy API).", flush=True)
+                    self.oww_model = Model(wakeword_models=[WAKE_WORD_MODEL], inference_framework="onnx")
+                    print("[INIT] Wake Word Loaded (ONNX).", flush=True)
+                except TypeError:
+                    try:
+                        self.oww_model = Model(wakeword_model_paths=[WAKE_WORD_MODEL])
+                        print("[INIT] Wake Word Loaded (Legacy API).", flush=True)
+                    except Exception as e:
+                        print(f"[CRITICAL] Failed to load wake word model: {e}")
                 except Exception as e:
                     print(f"[CRITICAL] Failed to load wake word model: {e}")
-            except Exception as e:
-                print(f"[CRITICAL] Failed to load wake word model: {e}")
+            else:
+                print("[CRITICAL] Wake word model file not found or package unavailable.")
         else:
-            print(f"[CRITICAL] Wake word model file not found or package unavailable.")
+            print(f"[INIT] Wake Word Engine: Whisper phrases={self.wake_words}", flush=True)
 
         # --- SPEECH TO TEXT INITIALIZATION ---
         print("[INIT] Loading Whisper model...", flush=True)
@@ -1004,7 +1249,10 @@ class BotGUI:
         else:
             print("[CRITICAL] Whisper STT unavailable.")
 
-        # --- AUDIO OUTPUT SETUP ---
+        # --- AUDIO INPUT & OUTPUT SETUP ---
+        self._input_samplerate = choose_input_samplerate(
+            INPUT_DEVICE_NAME, CURRENT_CONFIG.get("input_sample_rate")
+        )
         self._output_device = self._find_output_device()
         self._piper_process = None
         self._init_piper()
@@ -1060,17 +1308,27 @@ class BotGUI:
             print("[CAM] Preview overlay enabled", flush=True)
 
     def handle_camera_frame(self, frame_rgb):
-        """Processes and schedules camera preview frame updates in the GUI thread."""
+        """Resizes preview frame on camera thread and builds PhotoImage on Tk main thread."""
+        if self._cam_preview_pending or self.exiting or not self.camera_pipeline.preview_enabled:
+            return
         try:
             img = Image.fromarray(frame_rgb).resize((self.CAM_W, self.CAM_H), Image.BILINEAR)
-            photo = ImageTk.PhotoImage(img)
-            
-            def _update(p=photo):
-                if self.camera_pipeline.preview_enabled:
-                    self._cam_photo = p  # Keep alive
-                    self.cam_label.config(image=p)
+            self._cam_preview_pending = True
+
+            def _update(pil_img=img):
+                self._cam_preview_pending = False
+                if self.exiting or not self.camera_pipeline.preview_enabled:
+                    return
+                try:
+                    photo = ImageTk.PhotoImage(pil_img)
+                    self._cam_photo = photo  # Keep alive
+                    self.cam_label.config(image=photo)
+                except tk.TclError:
+                    pass
+
             self.master.after(0, _update)
         except Exception as e:
+            self._cam_preview_pending = False
             print(f"[CAM ERROR] Preview rendering failed: {e}", flush=True)
 
     def toggle_hud_visibility(self, event=None):
@@ -1160,28 +1418,19 @@ class BotGUI:
         self._cancel_auto_stop_timer()
         self.idle_event.set()
         self.interrupted.set()
+        self._sfx_abort.set()
+        self.thinking_sound_active.clear()
         self.recording_active.clear()
         self.ptt_event.clear()
-        with self.tts_queue_lock:
-            self.tts_queue.clear()
-        if self.current_audio_process:
-            try:
-                self.current_audio_process.terminate()
-            except:
-                pass
+        self._clear_tts_queue()
         self.set_state(BotStates.IDLE, "Idle.")
 
     def handle_speaking_interrupt(self, event=None):
         if self.current_state in (BotStates.SPEAKING, BotStates.THINKING):
             self.interrupted.set()
+            self._sfx_abort.set()
             self.thinking_sound_active.clear()
-            with self.tts_queue_lock:
-                self.tts_queue.clear()
-            if self.current_audio_process:
-                try:
-                    self.current_audio_process.terminate()
-                except:
-                    pass
+            self._clear_tts_queue()
             self.set_state(BotStates.IDLE, "Interrupted.")
 
     def exit_fullscreen(self, event=None):
@@ -1195,32 +1444,29 @@ class BotGUI:
         self.stop_event.set()
         self.interrupted.set()
         self.idle_event.set()
+        self._sfx_abort.set()
         self._cancel_auto_stop_timer()
         print("\n--- SHUTDOWN SEQUENCE STARTED ---", flush=True)
 
         self.recording_active.clear()
         self.thinking_sound_active.clear()
-        self.tts_active.clear()
-        with self.tts_queue_lock:
-            self.tts_queue.clear()
+        self._clear_tts_queue()
+        with self.tts_cond:
+            self.tts_active.clear()
+            self.tts_cond.notify_all()
         self.ptt_event.set()  # Unblock any thread waiting on ptt_event
 
         # Wait for audio/agent worker threads to exit their streams BEFORE tearing down PortAudio
         current = threading.current_thread()
-        agent_thread = getattr(self, "agent_thread", None)
-        if agent_thread and agent_thread.is_alive() and agent_thread is not current:
-            agent_thread.join(timeout=2.0)
-        tts_thread = getattr(self, "tts_thread", None)
-        if tts_thread and tts_thread.is_alive() and tts_thread is not current:
-            tts_thread.join(timeout=1.5)
+        for t, wait_s in (
+            (getattr(self, "agent_thread", None), 2.0),
+            (getattr(self, "tts_thread", None), 1.5),
+            (getattr(self, "_thinking_thread", None), 1.0),
+        ):
+            if t and t.is_alive() and t is not current:
+                t.join(timeout=wait_s)
 
-        piper_proc = getattr(self, "_piper_process", None)
-        if piper_proc and piper_proc.poll() is None:
-            try:
-                piper_proc.terminate()
-                piper_proc.wait(timeout=1)
-            except Exception:
-                pass
+        self._kill_piper()
 
         # Stop sub-threads
         if self.camera_pipeline:
@@ -1228,34 +1474,29 @@ class BotGUI:
         if self.motor_controller:
             self.motor_controller.stop()
 
-        if self.current_audio_process:
-            try:
-                self.current_audio_process.terminate()
-                self.current_audio_process.wait(timeout=1)
-            except:
-                pass
-
         self.save_chat_history()
 
-        # Shutdown Ollama connection keepalive and free resources
+        # Shutdown Ollama connection keepalive with a short timeout
         try:
-            OLLAMA_CLIENT.generate(model=TEXT_MODEL, prompt="", keep_alive=0)
-        except:
+            OLLAMA_CLIENT.generate(model=TEXT_MODEL, prompt="", keep_alive=0, timeout=(1, 2))
+        except Exception:
             pass
+        OLLAMA_CLIENT.close()
         try:
             sd.stop()
-        except:
+        except Exception:
             pass
 
         try:
             self.master.quit()
+            self.master.destroy()
         except Exception:
             pass
 
     # --- ANIMATION ENGINE ---
 
     def load_animations(self):
-        base_path = "faces"
+        base_path = _resolve_path("faces")
         states = ["idle", "listening", "thinking", "speaking", "error", "warmup"]
         for state in states:
             folder = os.path.join(base_path, state)
@@ -1268,20 +1509,20 @@ class BotGUI:
                         self.animations[state].append(ImageTk.PhotoImage(img))
                     except Exception as e:
                         print(f"[GUI ERROR] Failed loading image {f}: {e}", flush=True)
-            
+
             # Draw standard fallback canvases if folders are missing/empty
             if not self.animations[state]:
-                if state in self.animations.get("idle", []):
+                if self.animations.get("idle"):
                     self.animations[state] = self.animations["idle"]
                 else:
                     color_mapping = {
-                        "warmup": "#FFFF00", # Yellow
-                        "listening": "#00FF00", # Green
-                        "thinking": "#FFA500", # Orange
-                        "speaking": "#800080", # Purple
-                        "error": "#FF0000" # Red
+                        "warmup": "#FFFF00",
+                        "listening": "#00FF00",
+                        "thinking": "#FFA500",
+                        "speaking": "#800080",
+                        "error": "#FF0000"
                     }
-                    fill = color_mapping.get(state, "#0000FF") # Default Blue
+                    fill = color_mapping.get(state, "#0000FF")
                     blank = Image.new('RGB', (self.BG_WIDTH, self.BG_HEIGHT), color=fill)
                     self.animations[state].append(ImageTk.PhotoImage(blank))
 
@@ -1292,10 +1533,12 @@ class BotGUI:
             return
 
         if self.current_state == BotStates.SPEAKING:
-            if len(frames) > 1:
-                self.current_frame_index = random.randint(1, len(frames) - 1)
-            else:
+            if len(frames) <= 1 or self.current_volume < 350:
                 self.current_frame_index = 0
+            elif len(frames) == 2:
+                self.current_frame_index = 1 if self.current_frame_index == 0 else 0
+            else:
+                self.current_frame_index = (self.current_frame_index % (len(frames) - 1)) + 1
         else:
             self.current_frame_index = (self.current_frame_index + 1) % len(frames)
 
@@ -1318,12 +1561,19 @@ class BotGUI:
             if self.current_state != state:
                 self.current_state = state
                 self.current_frame_index = 0
+                if state == BotStates.ERROR:
+                    self.play_sound_async(self.get_random_sound(error_sounds_dir), interruptible=False)
             if msg:
                 self.status_var.set(msg)
         try:
             self.master.after(0, _update)
         except (tk.TclError, RuntimeError):
             pass
+
+    def _trim_response_text(self, max_lines=200):
+        line_count = int(self.response_text.index("end-1c").split(".")[0])
+        if line_count > max_lines:
+            self.response_text.delete("1.0", f"{line_count - max_lines}.0")
 
     def append_to_text(self, text, newline=True):
         if self.exiting:
@@ -1335,6 +1585,7 @@ class BotGUI:
                     self.response_text.insert(tk.END, text + "\n")
                 else:
                     self.response_text.insert(tk.END, text)
+                self._trim_response_text()
                 self.response_text.see(tk.END)
                 self.response_text.config(state=tk.DISABLED)
             except tk.TclError:
@@ -1351,6 +1602,7 @@ class BotGUI:
             try:
                 self.response_text.config(state=tk.NORMAL)
                 self.response_text.insert(tk.END, chunk)
+                self._trim_response_text()
                 self.response_text.see(tk.END)
                 self.response_text.config(state=tk.DISABLED)
             except tk.TclError:
@@ -1364,19 +1616,25 @@ class BotGUI:
     # 6. ACTION ROUTER / TOOL EXECUTOR
     # =========================================================================
 
-    def extract_json_from_text(self, text):
-        try:
-            match = re.search(r'\{.*\}', text, re.DOTALL)
-            if match:
-                return json.loads(match.group(0))
+    @staticmethod
+    def extract_json_from_text(text):
+        if not text:
             return None
-        except:
-            return None
+        decoder = json.JSONDecoder()
+        for idx, ch in enumerate(text):
+            if ch == "{":
+                try:
+                    obj, _ = decoder.raw_decode(text, idx)
+                    if isinstance(obj, dict):
+                        return obj
+                except json.JSONDecodeError:
+                    continue
+        return None
 
     def execute_action_and_get_result(self, action_data):
-        raw_action = action_data.get("action", "").lower().strip()
+        raw_action = str(action_data.get("action", "")).lower().strip()
         value = action_data.get("value") or action_data.get("query")
-        
+
         VALID_TOOLS = {"get_time", "search_web", "describe_view"}
         ALIASES = {
             "google": "search_web", "browser": "search_web", "news": "search_web",
@@ -1396,59 +1654,61 @@ class BotGUI:
         if action == "get_time":
             now = datetime.datetime.now().strftime("%I:%M %p")
             return f"CHAT_FALLBACK::The current time is {now}."
-            
+
         elif action == "describe_view":
-            if self.camera_pipeline and self.camera_pipeline.latest_frame is not None:
+            latest_frame = self.camera_pipeline.get_latest_frame() if self.camera_pipeline else None
+            if latest_frame is not None:
                 detector = getattr(self, "object_detector", None)
                 if not detector:
                     detector = ObjectDetector()
                     self.object_detector = detector
-                
+
                 self.set_state(BotStates.THINKING, "Looking around...")
-                detected = detector.detect_objects(self.camera_pipeline.latest_frame)
+                detected = detector.detect_objects(latest_frame)
                 if detected:
                     return f"CHAT_FALLBACK::I see: {', '.join(detected)}."
                 else:
                     return "CHAT_FALLBACK::I don't see any recognizable objects."
             else:
                 return "CHAT_FALLBACK::My camera is currently inactive or warming up."
-        
+
         elif action == "search_web":
             if not DDGS_AVAILABLE:
                 return "SEARCH_ERROR"
-            print(f"Searching DuckDuckGo for: '{value}'...", flush=True)
+            query = str(value).strip() if value is not None else ""
+            if not query:
+                return "INVALID_ACTION"
+            print(f"Searching DuckDuckGo for: '{query}'...", flush=True)
+            wants_news = (
+                raw_action in ("news", "search_news")
+                or any(w in query.lower() for w in ("news", "headline", "headlines", "latest", "breaking"))
+            )
+            search_order = ("news", "text") if wants_news else ("text", "news")
             try:
                 with DDGS() as ddgs:
                     results = []
-                    # Try news search first
-                    try:
-                        results = list(ddgs.news(value, region='us-en', max_results=1))
-                        if results:
-                            print(f"[SEARCH] Found News: {results[0].get('title')}", flush=True)
-                    except Exception as e:
-                        print(f"[SEARCH DEBUG] News query failed: {e}", flush=True)
-                    
-                    # Fallback to general text search
-                    if not results:
+                    for mode in search_order:
                         try:
-                            results = list(ddgs.text(value, region='us-en', max_results=1))
+                            fn = ddgs.news if mode == "news" else ddgs.text
+                            results = list(fn(query, region='us-en', max_results=1))
                             if results:
-                                print(f"[SEARCH] Found Text: {results[0].get('title')}", flush=True)
+                                print(f"[SEARCH] Found {mode.title()}: {results[0].get('title')}", flush=True)
+                                break
                         except Exception as e:
-                            print(f"[SEARCH DEBUG] Text query failed: {e}", flush=True)
+                            print(f"[SEARCH DEBUG] {mode.title()} query failed: {e}", flush=True)
 
                     if results:
                         r = results[0]
                         title = r.get('title', 'No Title')
                         body = r.get('body', r.get('snippet', 'No Body'))
-                        return f"SEARCH RESULTS for '{value}':\nTitle: {title}\nSnippet: {body[:300]}"
+                        return f"SEARCH RESULTS for '{query}':\nTitle: {title}\nSnippet: {body[:300]}"
                     else:
                         print("[SEARCH] Returned 0 results.", flush=True)
                         return "SEARCH_EMPTY"
             except Exception as e:
                 print(f"[SEARCH ERROR] Connection/API error: {e}", flush=True)
                 return "SEARCH_ERROR"
-        
+
         return None
 
     # =========================================================================
@@ -1462,8 +1722,10 @@ class BotGUI:
             self.tts_thread.start()
             
             while not self.exiting and not self.stop_event.is_set():
+                user_text = None
                 if self._auto_followup:
                     self._auto_followup = False
+                    self._pending_wake_command = ""
                     if self.idle_event.is_set() or self.interrupted.is_set():
                         continue
                     if self.ptt_event.is_set():
@@ -1478,33 +1740,46 @@ class BotGUI:
                 else:
                     trigger_source = self.detect_wake_word_or_ptt()
                     if trigger_source == "EXIT" or self.exiting or self.stop_event.is_set():
+                        self._pending_wake_command = ""
                         break
                     if self.interrupted.is_set():
+                        self._pending_wake_command = ""
                         self.interrupted.clear()
                         self.set_state(BotStates.IDLE, "Resetting...")
                         continue
 
+                    pending_cmd = self._pending_wake_command
+                    self._pending_wake_command = ""
                     self.idle_event.clear()
-                    self.set_state(BotStates.LISTENING, "I'm listening!")
-                    
-                    audio_file = None
-                    if trigger_source == "PTT":
-                        audio_file = self.record_voice_ptt()
-                    else:
-                        audio_file = self.record_voice_adaptive()
 
-                if self.exiting or self.stop_event.is_set():
-                    break
-                if not audio_file:
-                    self.set_state(BotStates.IDLE, "Heard nothing.")
-                    continue
-                
-                user_text = self.transcribe_audio(audio_file)
-                if self.exiting or self.stop_event.is_set():
-                    break
-                if not user_text:
-                    self.set_state(BotStates.IDLE, "Transcription empty.")
-                    continue
+                    if trigger_source == "WAKE" and pending_cmd:
+                        user_text = pending_cmd
+                        audio_file = None
+                    else:
+                        self.set_state(BotStates.LISTENING, "I'm listening!")
+                        audio_file = (
+                            self.record_voice_ptt()
+                            if trigger_source == "PTT"
+                            else self.record_voice_adaptive()
+                        )
+
+                if user_text is None:
+                    if self.exiting or self.stop_event.is_set():
+                        break
+                    has_audio = (
+                        audio_file is not None
+                        and (not isinstance(audio_file, np.ndarray) or audio_file.size > 0)
+                    )
+                    if not has_audio:
+                        self.set_state(BotStates.IDLE, "Heard nothing.")
+                        continue
+
+                    user_text = self.transcribe_audio(audio_file)
+                    if self.exiting or self.stop_event.is_set():
+                        break
+                    if not user_text:
+                        self.set_state(BotStates.IDLE, "Transcription empty.")
+                        continue
                 
                 self.append_to_text(f"YOU: {user_text}")
                 self.interrupted.clear()
@@ -1562,10 +1837,79 @@ class BotGUI:
             except Exception as e:
                 print(f"Failed loading LLM model {TEXT_MODEL}: {gen_err} / {e}", flush=True)
         
-        self.play_sound(self.get_random_sound(greeting_sounds_dir))
+        self.play_sound(self.get_random_sound(greeting_sounds_dir), interruptible=False)
         print("[INIT] Models loaded & active.", flush=True)
 
+    def _wait_for_ptt_fallback(self):
+        self.ptt_event.wait()
+        if self.exiting or self.stop_event.is_set():
+            return "EXIT"
+        self.ptt_event.clear()
+        return "PTT"
+
+    def _check_listen_interrupts(self, check_cli=True):
+        if self.exiting or self.stop_event.is_set():
+            raise StopIteration("EXIT")
+        if self.ptt_event.is_set():
+            self.ptt_event.clear()
+            print("\n[AUDIO] Wake word stream interrupted by PTT.", flush=True)
+            raise StopIteration("PTT")
+        if check_cli:
+            try:
+                rlist, _, _ = select.select([sys.stdin], [], [], 0)
+                if rlist:
+                    sys.stdin.readline()
+                    raise StopIteration("CLI")
+            except StopIteration:
+                raise
+            except Exception:
+                pass
+
+    @staticmethod
+    def _make_audio_queue_callback(audio_q):
+        def _audio_cb(indata, frames, time_info, status):
+            if status and getattr(status, "input_overflow", False):
+                try:
+                    audio_q.put_nowait((None, True))
+                except queue.Full:
+                    pass
+                return
+            try:
+                audio_q.put_nowait((indata.copy(), False))
+            except queue.Full:
+                try:
+                    audio_q.get_nowait()
+                    audio_q.put_nowait((indata.copy(), False))
+                except (queue.Empty, queue.Full):
+                    pass
+        return _audio_cb
+
+    @staticmethod
+    def _drain_audio_queue(audio_q):
+        while not audio_q.empty():
+            try:
+                audio_q.get_nowait()
+            except queue.Empty:
+                break
+
+    @staticmethod
+    def _print_wake_meter(samples, in_speech, last_meter_time):
+        if not IS_TTY:
+            return last_meter_time
+        now_t = time.time()
+        if now_t - last_meter_time < 0.08:
+            return last_meter_time
+        current_max = int(np.max(np.abs(samples))) if samples.size > 0 else 0
+        bar_length = 30
+        filled = min(bar_length, int((current_max / 32768) * bar_length))
+        bar = "█" * filled + "░" * (bar_length - filled)
+        level_label = "LOUD" if current_max > 10000 else ("MED " if current_max > 2000 else "LOW ")
+        state_tag = " | 🎙️ Speech..." if in_speech else ""
+        print(f"\r[MIC] {level_label} |{bar}| {current_max:5d}{state_tag}   ", end="", flush=True)
+        return now_t
+
     def detect_wake_word_or_ptt(self):
+        self._pending_wake_command = ""
         if self.exiting or self.stop_event.is_set():
             return "EXIT"
         if self.ptt_event.is_set():
@@ -1573,22 +1917,21 @@ class BotGUI:
             return "PTT"
 
         self.set_state(BotStates.IDLE, "Waiting...")
-        
-        if self.oww_model:
-            self.oww_model.reset()
 
-        if self.oww_model is None:
-            self.ptt_event.wait()
-            if self.exiting or self.stop_event.is_set():
-                return "EXIT"
-            self.ptt_event.clear()
-            return "PTT"
+        use_oww = (getattr(self, "wake_word_engine", "whisper") == "openwakeword")
+        if use_oww:
+            if self.oww_model:
+                self.oww_model.reset()
+            if self.oww_model is None:
+                return self._wait_for_ptt_fallback()
+        elif self.whisper_model is None:
+            print("[AUDIO WARNING] Whisper unavailable for wake word — waiting for PTT.", flush=True)
+            return self._wait_for_ptt_fallback()
 
         OWW_SAMPLE_RATE = 16000
         OWW_CHUNK = 1280
 
-        input_rate = choose_input_samplerate(INPUT_DEVICE_NAME, CURRENT_CONFIG.get("input_sample_rate"))
-        use_resampling = (input_rate != OWW_SAMPLE_RATE)
+        input_rate = self._input_samplerate
         BLOCK_SIZE = 1024
 
         stream_args = {
@@ -1600,21 +1943,21 @@ class BotGUI:
             "latency": "high",
         }
 
-        print(f"[AUDIO] Wake word stream: {input_rate}Hz resample={use_resampling}", flush=True)
-
         try:
-            self._listen_loop(stream_args, input_rate, OWW_SAMPLE_RATE, OWW_CHUNK, use_resampling)
+            if use_oww:
+                use_resampling = (input_rate != OWW_SAMPLE_RATE)
+                print(f"[AUDIO] Wake word stream: {input_rate}Hz resample={use_resampling}", flush=True)
+                self._listen_loop(stream_args, input_rate, OWW_SAMPLE_RATE, OWW_CHUNK, use_resampling)
+            else:
+                print(f"[AUDIO] Wake word stream (whisper): {input_rate}Hz phrases={self.wake_words}", flush=True)
+                self._listen_loop_whisper(stream_args, input_rate)
         except StopIteration as si:
             return str(si)
         except Exception as e:
             if self.exiting or self.stop_event.is_set():
                 return "EXIT"
             print(f"[AUDIO] Stream error: {e}. Falling back to PTT.", flush=True)
-            self.ptt_event.wait()
-            if self.exiting or self.stop_event.is_set():
-                return "EXIT"
-            self.ptt_event.clear()
-            return "PTT"
+            return self._wait_for_ptt_fallback()
 
         if self.exiting or self.stop_event.is_set():
             return "EXIT"
@@ -1643,71 +1986,90 @@ class BotGUI:
         except Exception:
             pass
 
-    def _listen_loop(self, stream_args, input_rate, oww_rate, oww_chunk, use_resampling):
-        needed_input_samples = int(oww_chunk * (input_rate / oww_rate)) if use_resampling else oww_chunk
-        accumulator = np.array([], dtype=np.int16)
+    def _transcribe_wake_audio(self, audio_float32):
+        """Runs fast Whisper decoding on a candidate wake-word speech burst."""
+        if self.whisper_model is None or audio_float32 is None or audio_float32.size < 3200:
+            return ""
+        try:
+            segments, _ = self.whisper_model.transcribe(
+                audio_float32,
+                language="en",
+                beam_size=1,
+                temperature=0.0,
+                initial_prompt=_format_wake_prompt(self.wake_words),
+                vad_filter=True,
+                vad_parameters=dict(
+                    threshold=0.45,
+                    min_speech_duration_ms=150,
+                    min_silence_duration_ms=250,
+                    speech_pad_ms=150,
+                ),
+                condition_on_previous_text=False,
+                no_speech_threshold=0.6,
+                compression_ratio_threshold=2.0,
+                log_prob_threshold=-1.0,
+            )
+            kept_segs = [
+                seg for seg in segments
+                if getattr(seg, "no_speech_prob", 0.0) < 0.65
+                and getattr(seg, "avg_logprob", 0.0) > -1.05
+            ]
+            return " ".join(seg.text for seg in kept_segs).strip()
+        except Exception as e:
+            print(f"\n[WAKE STT ERROR] Whisper wake decode failed: {e}", flush=True)
+            return ""
+
+    def _listen_loop_whisper(self, stream_args, input_rate):
+        """Listens continuously and detects configured wake phrases via Whisper."""
+        blocksize = int(stream_args.get("blocksize", 1024))
         overflow_count = 0
         MAX_OVERFLOWS = 30
-        audio_q = queue.Queue(maxsize=64)
+        audio_q = queue.Queue(maxsize=128)
 
-        def _audio_cb(indata, frames, time_info, status):
-            if status and getattr(status, "input_overflow", False):
-                try:
-                    audio_q.put_nowait((None, True))
-                except queue.Full:
-                    pass
-                return
-            try:
-                audio_q.put_nowait((indata.copy(), False))
-            except queue.Full:
-                try:
-                    audio_q.get_nowait()
-                    audio_q.put_nowait((indata.copy(), False))
-                except (queue.Empty, queue.Full):
-                    pass
+        calib_chunks_needed = max(3, int(round(0.3 * input_rate / blocksize)))
+        preroll_max_chunks = max(4, int(round(0.45 * input_rate / blocksize)))
+        min_speech_chunks = max(2, int(round(0.12 * input_rate / blocksize)))
+        SILENCE_END_SEC = 0.55
+        MAX_BURST_SEC = 4.0
+
+        calib_rms = []
+        preroll = deque(maxlen=preroll_max_chunks)
+        noise_floor = 0.008
+
+        def _compute_thresholds(floor):
+            return max(0.015, floor * 1.9 + 0.006), max(0.010, floor * 1.35 + 0.004)
+
+        speech_threshold, silence_threshold = _compute_thresholds(noise_floor)
+        in_speech = False
+        speech_chunks = []
+        burst_rms_vals = []
+        speech_active_chunks = 0
+        burst_samples = 0
+        silence_samples = 0
+        last_meter_time = 0.0
+
+        try:
+            sos = scipy.signal.butter(2, 150.0, btype="highpass", fs=input_rate, output="sos")
+            zi = scipy.signal.sosfilt_zi(sos) * 0.0
+        except Exception:
+            sos = None
+            zi = None
 
         cb_args = dict(stream_args)
-        cb_args["callback"] = _audio_cb
+        cb_args["callback"] = self._make_audio_queue_callback(audio_q)
         stream = sd.InputStream(**cb_args)
         stream.start()
         try:
             while not self.exiting and not self.stop_event.is_set():
-                # Polling interrupts
-                if self.exiting or self.stop_event.is_set():
-                    raise StopIteration("EXIT")
-                if self.ptt_event.is_set():
-                    self.ptt_event.clear()
-                    print("\n[AUDIO] Wake word stream interrupted by PTT.", flush=True)
-                    raise StopIteration("PTT")
-
-                try:
-                    rlist, _, _ = select.select([sys.stdin], [], [], 0)
-                    if rlist:
-                        sys.stdin.readline()
-                        raise StopIteration("CLI")
-                except StopIteration:
-                    raise
-                except Exception:
-                    pass
+                self._check_listen_interrupts(check_cli=True)
 
                 try:
                     data, overflow = audio_q.get(timeout=0.05)
                 except queue.Empty:
-                    if self.exiting or self.stop_event.is_set():
-                        raise StopIteration("EXIT")
-                    if self.ptt_event.is_set():
-                        self.ptt_event.clear()
-                        print("\n[AUDIO] Wake word stream interrupted by PTT.", flush=True)
-                        raise StopIteration("PTT")
+                    self._check_listen_interrupts(check_cli=False)
                     continue
 
-                if self.exiting or self.stop_event.is_set():
-                    raise StopIteration("EXIT")
-
-                if self.ptt_event.is_set():
-                    self.ptt_event.clear()
-                    print("\n[AUDIO] Wake word stream interrupted by PTT.", flush=True)
-                    raise StopIteration("PTT")
+                self._check_listen_interrupts(check_cli=False)
 
                 if overflow:
                     overflow_count += 1
@@ -1720,13 +2082,150 @@ class BotGUI:
                 chunk = np.asarray(data, dtype=np.int16)
                 if chunk.ndim > 1:
                     chunk = chunk.flatten()
-                accumulator = np.concatenate((accumulator, chunk))
 
-                if len(accumulator) < needed_input_samples:
+                chunk_f = chunk.astype(np.float32) / 32768.0
+                if sos is not None and chunk_f.size > 0:
+                    chunk_hp, zi = scipy.signal.sosfilt(sos, chunk_f, zi=zi)
+                elif chunk_f.size > 0:
+                    chunk_hp = chunk_f - float(np.mean(chunk_f))
+                else:
+                    chunk_hp = chunk_f
+                rms = float(np.sqrt(np.mean(chunk_hp * chunk_hp))) if chunk_hp.size > 0 else 0.0
+
+                if len(calib_rms) < calib_chunks_needed:
+                    calib_rms.append(rms)
+                    if len(calib_rms) < calib_chunks_needed:
+                        preroll.append(chunk)
+                        last_meter_time = self._print_wake_meter(chunk, in_speech, last_meter_time)
+                        continue
+                    noise_floor = min(float(np.percentile(calib_rms, 25)), 0.15)
+                    self._ambient_noise_floor = noise_floor
+                    speech_threshold, silence_threshold = _compute_thresholds(noise_floor)
+
+                if not in_speech:
+                    if rms >= speech_threshold:
+                        in_speech = True
+                        speech_chunks = list(preroll)
+                        speech_chunks.append(chunk)
+                        burst_rms_vals = [rms]
+                        speech_active_chunks = 1
+                        burst_samples = chunk.size
+                        silence_samples = 0
+                        preroll.clear()
+                    else:
+                        if rms < noise_floor:
+                            noise_floor = noise_floor * 0.92 + rms * 0.08
+                            self._ambient_noise_floor = noise_floor
+                            speech_threshold, silence_threshold = _compute_thresholds(noise_floor)
+                        elif rms < speech_threshold:
+                            noise_floor = noise_floor * 0.985 + rms * 0.015
+                            self._ambient_noise_floor = noise_floor
+                            speech_threshold, silence_threshold = _compute_thresholds(noise_floor)
+                        preroll.append(chunk)
+                else:
+                    speech_chunks.append(chunk)
+                    burst_rms_vals.append(rms)
+                    burst_samples += chunk.size
+                    if rms >= silence_threshold:
+                        silence_samples = 0
+                        if rms >= speech_threshold:
+                            speech_active_chunks += 1
+                    else:
+                        silence_samples += chunk.size
+
+                    silence_sec = silence_samples / float(input_rate)
+                    burst_sec = burst_samples / float(input_rate)
+                    if silence_sec >= SILENCE_END_SEC or burst_sec >= MAX_BURST_SEC:
+                        chunks_to_process = speech_chunks
+                        active_chunks = speech_active_chunks
+                        rms_snapshot = burst_rms_vals
+                        hit_max_cap = (burst_sec >= MAX_BURST_SEC and silence_sec < SILENCE_END_SEC)
+
+                        in_speech = False
+                        speech_chunks = []
+                        burst_rms_vals = []
+                        speech_active_chunks = 0
+                        burst_samples = 0
+                        silence_samples = 0
+                        preroll.clear()
+
+                        if active_chunks >= min_speech_chunks and chunks_to_process:
+                            burst_int16 = np.concatenate(chunks_to_process)
+                            burst_f32 = burst_int16.astype(np.float32) / 32768.0
+                            burst_f32 = _highpass_filter(burst_f32, input_rate, cutoff_hz=150.0)
+                            if input_rate != 16000:
+                                from math import gcd
+                                g = gcd(int(input_rate), 16000)
+                                burst_f32 = scipy.signal.resample_poly(
+                                    burst_f32, 16000 // g, int(input_rate) // g
+                                ).astype(np.float32)
+                            burst_f32 = np.ascontiguousarray(burst_f32, dtype=np.float32)
+
+                            heard_text = self._transcribe_wake_audio(burst_f32)
+                            self._drain_audio_queue(audio_q)
+                            overflow_count = 0
+                            self._check_listen_interrupts(check_cli=False)
+
+                            matched_phrase, trailing = _match_wake_phrase(heard_text, self._wake_patterns)
+                            if matched_phrase:
+                                print(f"\n[WAKE] Wake Word Triggered ('{matched_phrase}')! Heard: '{heard_text}'", flush=True)
+                                self._pending_wake_command = trailing
+                                return
+                            if heard_text:
+                                print(f"\n[WAKE HEAR] '{heard_text}'", flush=True)
+                            elif hit_max_cap and rms_snapshot:
+                                noise_floor = min(0.15, noise_floor * 0.7 + float(np.median(rms_snapshot)) * 0.3)
+                                speech_threshold, silence_threshold = _compute_thresholds(noise_floor)
+
+                last_meter_time = self._print_wake_meter(chunk, in_speech, last_meter_time)
+        finally:
+            self._close_stream(stream)
+
+        if self.exiting or self.stop_event.is_set():
+            raise StopIteration("EXIT")
+
+    def _listen_loop(self, stream_args, input_rate, oww_rate, oww_chunk, use_resampling):
+        needed_input_samples = int(oww_chunk * (input_rate / oww_rate)) if use_resampling else oww_chunk
+        needed_bytes = needed_input_samples * 2
+        pcm_buf = bytearray()
+        overflow_count = 0
+        MAX_OVERFLOWS = 30
+        audio_q = queue.Queue(maxsize=64)
+
+        cb_args = dict(stream_args)
+        cb_args["callback"] = self._make_audio_queue_callback(audio_q)
+        stream = sd.InputStream(**cb_args)
+        stream.start()
+        try:
+            while not self.exiting and not self.stop_event.is_set():
+                self._check_listen_interrupts(check_cli=True)
+
+                try:
+                    data, overflow = audio_q.get(timeout=0.05)
+                except queue.Empty:
+                    self._check_listen_interrupts(check_cli=False)
                     continue
 
-                window = accumulator[:needed_input_samples]
-                accumulator = accumulator[needed_input_samples:]
+                self._check_listen_interrupts(check_cli=False)
+
+                if overflow:
+                    overflow_count += 1
+                    if overflow_count > MAX_OVERFLOWS:
+                        raise RuntimeError(f"Stream buffer overflows exceeded limit ({overflow_count})")
+                    continue
+                else:
+                    overflow_count = max(0, overflow_count - 1)
+
+                chunk = np.asarray(data, dtype=np.int16)
+                if chunk.ndim > 1:
+                    chunk = chunk.flatten()
+                pcm_buf.extend(chunk.tobytes())
+
+                if len(pcm_buf) < needed_bytes:
+                    continue
+
+                window = np.frombuffer(pcm_buf[:needed_bytes], dtype=np.int16).copy()
+                del pcm_buf[:needed_bytes]
 
                 if use_resampling:
                     from math import gcd
@@ -1739,10 +2238,6 @@ class BotGUI:
                         window = np.pad(window, (0, oww_chunk - len(window)))
 
                 current_max = int(np.max(np.abs(window)))
-                bar_length = 30
-                filled = int((current_max / 32768) * bar_length)
-                bar = "█" * filled + "░" * (bar_length - filled)
-                level_label = "LOUD" if current_max > 10000 else ("MED " if current_max > 2000 else "LOW ")
                 oww_score_str = ""
 
                 if current_max > 200:
@@ -1756,7 +2251,12 @@ class BotGUI:
                             self.oww_model.reset()
                             return
 
-                print(f"\r[MIC] {level_label} |{bar}| {current_max:5d}{oww_score_str}   ", end="", flush=True)
+                if IS_TTY:
+                    bar_length = 30
+                    filled = int((current_max / 32768) * bar_length)
+                    bar = "█" * filled + "░" * (bar_length - filled)
+                    level_label = "LOUD" if current_max > 10000 else ("MED " if current_max > 2000 else "LOW ")
+                    print(f"\r[MIC] {level_label} |{bar}| {current_max:5d}{oww_score_str}   ", end="", flush=True)
         finally:
             self._close_stream(stream)
 
@@ -1767,19 +2267,21 @@ class BotGUI:
         if self.exiting or self.stop_event.is_set():
             return None
         print("Recording (Adaptive)...", flush=True)
-        samplerate = choose_input_samplerate(INPUT_DEVICE_NAME, CURRENT_CONFIG.get("input_sample_rate"))
+        samplerate = self._input_samplerate
 
         silence_duration = float(CURRENT_CONFIG.get("silence_duration", 0.9))
         no_speech_timeout = float(CURRENT_CONFIG.get("no_speech_timeout", 4.0))
         max_record_time = float(CURRENT_CONFIG.get("max_record_time", 10.0))
         blocksize = 1024
-        calib_chunks_needed = max(3, int(round(0.25 * samplerate / blocksize)))
 
         buffer = []
-        calib_rms = []
-        noise_floor = 0.008
-        speech_threshold = 0.025
-        silence_threshold = 0.016
+        audio_q = queue.Queue(maxsize=128)
+        noise_floor = float(np.clip(getattr(self, "_ambient_noise_floor", 0.008), 0.002, 0.12))
+
+        def _compute_thresholds(floor):
+            return max(0.015, floor * 2.2 + 0.008), max(0.010, floor * 1.5 + 0.004)
+
+        speech_threshold, silence_threshold = _compute_thresholds(noise_floor)
         speech_detected = False
         last_speech_time = None
         peak_rms = 0.0
@@ -1791,62 +2293,23 @@ class BotGUI:
             sos = None
             zi = None
 
-        def callback(indata, frames, time_info, status):
-            nonlocal noise_floor, speech_threshold, silence_threshold, speech_detected, last_speech_time, peak_rms, zi
-            buffer.append(indata.copy())
-            chunk_f = indata.astype(np.float32).flatten() / 32768.0
-            if sos is not None and chunk_f.size > 0:
-                chunk_hp, zi = scipy.signal.sosfilt(sos, chunk_f, zi=zi)
-            elif chunk_f.size > 0:
-                chunk_hp = chunk_f - float(np.mean(chunk_f))
-            else:
-                chunk_hp = chunk_f
-            rms = float(np.sqrt(np.mean(chunk_hp * chunk_hp))) if chunk_hp.size > 0 else 0.0
-            if rms > peak_rms:
-                peak_rms = rms
-
-            if len(calib_rms) < calib_chunks_needed:
-                calib_rms.append(rms)
-                if len(calib_rms) == calib_chunks_needed:
-                    noise_floor = min(float(np.percentile(calib_rms, 25)), 0.15)
-                    speech_threshold = max(0.015, noise_floor * 2.2 + 0.008)
-                    silence_threshold = max(0.010, noise_floor * 1.5 + 0.004)
-                elif rms >= 0.08:
-                    speech_detected = True
-                    last_speech_time = time.time()
-                    return
-                else:
-                    return
-            elif rms < noise_floor:
-                noise_floor = noise_floor * 0.9 + rms * 0.1
-                speech_threshold = max(0.015, noise_floor * 2.2 + 0.008)
-                silence_threshold = max(0.010, noise_floor * 1.5 + 0.004)
-
-            if rms >= speech_threshold:
-                speech_detected = True
-                last_speech_time = time.time()
-            elif speech_detected and rms >= silence_threshold:
-                last_speech_time = time.time()
-
         stream = None
         rec_start = time.time()
         try:
-            sd.stop()
-            time.sleep(0.1)
             if self.exiting or self.stop_event.is_set() or self.idle_event.is_set():
                 return None
             stream = sd.InputStream(
                 samplerate=samplerate,
                 channels=1,
                 dtype="int16",
-                callback=callback,
+                callback=self._make_audio_queue_callback(audio_q),
                 device=INPUT_DEVICE_NAME,
                 blocksize=blocksize,
                 latency="high",
             )
             stream.start()
             rec_start = time.time()
-            while not self.exiting and not self.stop_event.is_set() and not self.idle_event.is_set():
+            while not self.exiting and not self.stop_event.is_set() and not self.idle_event.is_set() and not self.interrupted.is_set():
                 now = time.time()
                 elapsed = now - rec_start
                 if elapsed >= max_record_time:
@@ -1855,7 +2318,41 @@ class BotGUI:
                     break
                 if not speech_detected and elapsed >= no_speech_timeout:
                     break
-                time.sleep(0.05)
+
+                try:
+                    data, overflow = audio_q.get(timeout=0.05)
+                except queue.Empty:
+                    continue
+                if overflow or data is None:
+                    continue
+
+                chunk = np.asarray(data, dtype=np.int16)
+                if chunk.ndim > 1:
+                    chunk = chunk.flatten()
+                buffer.append(chunk)
+
+                chunk_f = chunk.astype(np.float32) / 32768.0
+                if sos is not None and chunk_f.size > 0:
+                    chunk_hp, zi = scipy.signal.sosfilt(sos, chunk_f, zi=zi)
+                elif chunk_f.size > 0:
+                    chunk_hp = chunk_f - float(np.mean(chunk_f))
+                else:
+                    chunk_hp = chunk_f
+
+                rms = float(np.sqrt(np.mean(chunk_hp * chunk_hp))) if chunk_hp.size > 0 else 0.0
+                if rms > peak_rms:
+                    peak_rms = rms
+
+                if rms < noise_floor:
+                    noise_floor = noise_floor * 0.9 + rms * 0.1
+                    speech_threshold, silence_threshold = _compute_thresholds(noise_floor)
+
+                now = time.time()
+                if rms >= speech_threshold:
+                    speech_detected = True
+                    last_speech_time = now
+                elif speech_detected and rms >= silence_threshold:
+                    last_speech_time = now
         except Exception as e:
             if not self.exiting and not self.stop_event.is_set():
                 print(f"[AUDIO ERROR] Adaptive recording failed: {e}", flush=True)
@@ -1863,17 +2360,18 @@ class BotGUI:
         finally:
             self._close_stream(stream)
 
+        self._ambient_noise_floor = noise_floor
         print(
             f"[AUDIO] Adaptive done ({time.time() - rec_start:.1f}s | speech={speech_detected} "
             f"| peak_rms={peak_rms:.4f} | floor={noise_floor:.4f} | thresh={speech_threshold:.4f})",
             flush=True,
         )
-        if self.exiting or self.stop_event.is_set() or self.idle_event.is_set():
+        if self.exiting or self.stop_event.is_set() or self.idle_event.is_set() or self.interrupted.is_set():
             return None
         if not speech_detected:
             print("[AUDIO] No speech detected above floor — skipping transcription.", flush=True)
             return None
-        return self.save_audio_buffer(buffer, filename, samplerate)
+        return self.process_audio_buffer(buffer, filename, samplerate)
 
     def record_voice_ptt(self, filename="input.wav"):
         if self.exiting or self.stop_event.is_set():
@@ -1884,16 +2382,14 @@ class BotGUI:
             self.recording_active.set()
 
         print("Recording (PTT)...", flush=True)
-        samplerate = choose_input_samplerate(INPUT_DEVICE_NAME, CURRENT_CONFIG.get("input_sample_rate"))
+        samplerate = self._input_samplerate
         buffer = []
-        
+
         def callback(indata, frames, time_info, status):
             buffer.append(indata.copy())
-        
+
         stream = None
         try:
-            sd.stop()
-            time.sleep(0.1)
             if self.exiting or self.stop_event.is_set() or self.idle_event.is_set():
                 return None
             stream = sd.InputStream(
@@ -1908,7 +2404,7 @@ class BotGUI:
             stream.start()
             if duration is not None:
                 self._start_auto_stop_timer(duration)
-            while self.recording_active.is_set() and not self.exiting and not self.stop_event.is_set():
+            while self.recording_active.is_set() and not self.exiting and not self.stop_event.is_set() and not self.idle_event.is_set():
                 time.sleep(0.05)
         except Exception as e:
             if not self.exiting and not self.stop_event.is_set():
@@ -1919,11 +2415,12 @@ class BotGUI:
             self._cancel_auto_stop_timer()
             self.recording_active.clear()
 
-        if self.exiting or self.stop_event.is_set():
+        if self.exiting or self.stop_event.is_set() or self.idle_event.is_set():
             return None
-        return self.save_audio_buffer(buffer, filename, samplerate)
+        return self.process_audio_buffer(buffer, filename, samplerate)
 
-    def save_audio_buffer(self, buffer, filename, samplerate=16000):
+    def process_audio_buffer(self, buffer, filename="input.wav", samplerate=16000):
+        """High-pass filters and resamples captured audio in RAM for Whisper (zero SD writes)."""
         if not buffer:
             return None
         audio_data = np.concatenate(buffer, axis=0).flatten()
@@ -1936,27 +2433,30 @@ class BotGUI:
         else:
             audio_f = np.nan_to_num(audio_data.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
         audio_f = _highpass_filter(audio_f, samplerate, cutoff_hz=150.0)
-        audio_f = np.clip(audio_f, -1.0, 1.0)
-        audio_data = (audio_f * 32767).astype(np.int16)
 
         WHISPER_RATE = 16000
         if samplerate != WHISPER_RATE:
             from math import gcd
             g = gcd(int(samplerate), WHISPER_RATE)
             up, down = WHISPER_RATE // g, int(samplerate) // g
-            audio_data = scipy.signal.resample_poly(audio_data, up, down).astype(np.int16)
-            print(f"[AUDIO] Resampled {samplerate}Hz -> {WHISPER_RATE}Hz for Whisper", flush=True)
-            samplerate = WHISPER_RATE
+            audio_f = scipy.signal.resample_poly(audio_f, up, down).astype(np.float32)
 
-        with wave.open(filename, "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(samplerate)
-            wf.writeframes(audio_data.tobytes())
-        
-        print(f"[AUDIO] Saved {len(audio_data)/samplerate:.1f}s audio sample to {filename}", flush=True)
-        self.play_sound(self.get_random_sound(ack_sounds_dir))
-        return filename
+        audio_f = np.ascontiguousarray(np.clip(audio_f, -1.0, 1.0), dtype=np.float32)
+
+        if CURRENT_CONFIG.get("debug_save_wav", False) and filename:
+            wav_path = _resolve_path(filename)
+            with wave.open(wav_path, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(WHISPER_RATE)
+                wf.writeframes((audio_f * 32767.0).astype(np.int16).tobytes())
+            print(f"[AUDIO] Debug saved {len(audio_f)/WHISPER_RATE:.1f}s to {wav_path}", flush=True)
+
+        self.play_sound_async(self.get_random_sound(ack_sounds_dir))
+        return audio_f
+
+    def save_audio_buffer(self, buffer, filename, samplerate=16000):
+        return self.process_audio_buffer(buffer, filename, samplerate)
 
     def transcribe_audio(self, filename):
         print("Transcribing...", flush=True)
@@ -1967,7 +2467,7 @@ class BotGUI:
             if isinstance(filename, np.ndarray):
                 audio_float32 = np.ascontiguousarray(filename.squeeze(), dtype=np.float32)
             else:
-                with wave.open(filename, "rb") as wf:
+                with wave.open(_resolve_path(filename), "rb") as wf:
                     sr = wf.getframerate()
                     nchannels = wf.getnchannels()
                     sampwidth = wf.getsampwidth()
@@ -2007,7 +2507,7 @@ class BotGUI:
                 language="en",
                 beam_size=2,
                 temperature=0.0,
-                initial_prompt="BMO is a cute, helpful robot assistant. Hey BMO.",
+                initial_prompt=f"Noah is a cute, helpful robot assistant. {_format_wake_prompt(self.wake_words)}",
                 vad_filter=True,
                 vad_parameters=dict(
                     threshold=0.5,
@@ -2042,10 +2542,7 @@ class BotGUI:
                 transcription = ""
 
             if transcription:
-                transcription = re.sub(r'\b(bimo|beemo)\b', 'BMO', transcription, flags=re.IGNORECASE)
-                transcription = re.sub(r'\bhey\s+be\s+more\b', 'Hey BMO', transcription, flags=re.IGNORECASE)
-                if re.fullmatch(r'be\s+more[.!?]*', transcription.strip(), flags=re.IGNORECASE):
-                    transcription = 'BMO'
+                transcription = re.sub(r'\bhey\s+noa\b', 'Hey Noah', transcription, flags=re.IGNORECASE)
 
             if not transcription:
                 print("[STT] Heard: (nothing confident)", flush=True)
@@ -2085,6 +2582,66 @@ class BotGUI:
     def _norm_text(s):
         return re.sub(r'[^a-z0-9]+', ' ', str(s).lower()).strip()
 
+    _ABBREV_PAT = re.compile(r'\b(?:Dr|Mr|Mrs|Ms|Prof|Sr|Jr|St|vs|etc|e\.g|i\.e)\.', re.IGNORECASE)
+
+    @classmethod
+    def _split_complete_sentences(cls, text):
+        """Splits complete sentences while keeping abbreviations, decimals, and trailing fragments."""
+        if not text:
+            return [], ""
+        protected = cls._ABBREV_PAT.sub(lambda m: m.group(0).replace('.', '\x00'), text)
+        parts = re.split(r'(?<=[.!?])\s+|\n+', protected)
+        if len(parts) <= 1:
+            return [], text
+        sentences = [p.replace('\x00', '.').strip() for p in parts[:-1] if p.strip()]
+        remainder = parts[-1].replace('\x00', '.')
+        return sentences, remainder
+
+    @staticmethod
+    def _is_potential_action_prefix(stripped):
+        if not stripped:
+            return True
+        if stripped.startswith('{') or stripped.startswith('```'):
+            return True
+        for prefix in ("```json", "```"):
+            if prefix.startswith(stripped.lower()):
+                return True
+        return False
+
+    @staticmethod
+    def _is_action_payload(stripped):
+        return bool(stripped.startswith('{') or re.match(r'^```(?:json)?\s*\{', stripped, re.IGNORECASE))
+
+    def _enqueue_tts(self, text):
+        clean = (text or "").strip()
+        if not clean:
+            return
+        with self.tts_cond:
+            self.tts_queue.append(clean)
+            self.tts_cond.notify_all()
+
+    def _clear_tts_queue(self):
+        with self.tts_cond:
+            self.tts_queue.clear()
+            self.tts_cond.notify_all()
+
+    def _commit_turn(self, user_msg, assistant_text):
+        if not self.chat_memory_enabled or not str(assistant_text).strip():
+            return
+        self.session_memory.append(user_msg)
+        self.session_memory.append({"role": "assistant", "content": str(assistant_text)})
+        if len(self.session_memory) > 6:
+            self.session_memory = self.session_memory[-6:]
+
+    def _start_thinking_sound(self):
+        self._sfx_abort.clear()
+        self.thinking_sound_active.set()
+        if self._thinking_thread is None or not self._thinking_thread.is_alive():
+            self._thinking_thread = threading.Thread(
+                target=self._run_thinking_sound_loop, daemon=True, name="ThinkingSoundThread"
+            )
+            self._thinking_thread.start()
+
     def chat_and_respond(self, text):
         if "forget everything" in text.lower() or "reset memory" in text.lower():
             self.session_memory = []
@@ -2092,26 +2649,50 @@ class BotGUI:
             self._last_assistant_reply_norm = ""
             self._last_user_text_norm = ""
             self.save_chat_history()
-            with self.tts_queue_lock:
-                self.tts_queue.append("Okay. Memory wiped.")
+            self.append_to_text("BOT: Okay. Memory wiped.")
+            self._enqueue_tts("Okay. Memory wiped.")
+            self.wait_for_tts()
             self.set_state(BotStates.IDLE, "Memory Wiped")
             return True
 
         self.set_state(BotStates.THINKING, "Thinking...")
-        
+
         user_msg = {"role": "user", "content": text}
-        messages = self.permanent_memory + self.session_memory + [user_msg]
-        self.session_memory.append(user_msg)
-        
-        self.thinking_sound_active.set()
-        threading.Thread(target=self._run_thinking_sound_loop, daemon=True, name="ThinkingSoundThread").start()
-        
+        if self.chat_memory_enabled:
+            messages = self.permanent_memory + self.session_memory + [user_msg]
+        else:
+            messages = [{"role": "system", "content": SYSTEM_PROMPT}, user_msg]
+
+        user_norm = self._norm_text(text)
+        self._start_thinking_sound()
+
         full_response_buffer = ""
         chunk_buffer = ""
+        buffered_gui_chunks = []
+        hold_for_repeat = bool(
+            self._last_assistant_reply_norm and user_norm != self._last_user_text_norm
+        )
+
+        def _flush_held_to_gui_and_tts():
+            nonlocal chunk_buffer, bot_label_written
+            if not bot_label_written:
+                self.append_to_text("BOT: ", newline=False)
+                bot_label_written = True
+            if buffered_gui_chunks:
+                joined = "".join(buffered_gui_chunks)
+                buffered_gui_chunks.clear()
+                self._stream_to_text(joined)
+                chunk_buffer += joined
+            sentences, chunk_buffer = self._split_complete_sentences(chunk_buffer)
+            for sent in sentences:
+                clean_s = sent.encode('ascii', 'ignore').decode('ascii').strip()
+                if clean_s and re.search(r'[a-zA-Z0-9]', clean_s):
+                    self._enqueue_tts(clean_s)
 
         try:
             stream = OLLAMA_CLIENT.chat(model=TEXT_MODEL, messages=messages, stream=True, options=OLLAMA_OPTIONS)
             is_action_mode = False
+            action_decided = False
             bot_label_written = False
 
             try:
@@ -2124,44 +2705,43 @@ class BotGUI:
                     content = raw.encode('ascii', 'ignore').decode('ascii')
                     full_response_buffer += content
 
-                    # Determine action mode based on the first non-whitespace character in the stream
                     stripped = full_response_buffer.lstrip()
-                    if stripped and stripped.startswith('{'):
-                        is_action_mode = True
+                    if not action_decided:
+                        if self._is_action_payload(stripped):
+                            is_action_mode = True
+                            action_decided = True
+                            self.thinking_sound_active.clear()
+                            buffered_gui_chunks.clear()
+                            continue
+                        if len(stripped) < 16 and self._is_potential_action_prefix(stripped):
+                            buffered_gui_chunks.append(content)
+                            continue
+                        action_decided = True
                         self.thinking_sound_active.clear()
-                        continue
 
                     if is_action_mode:
                         continue
 
                     self.thinking_sound_active.clear()
+                    buffered_gui_chunks.append(content)
 
-                    if not bot_label_written:
-                        self.append_to_text("BOT: ", newline=False)
-                        bot_label_written = True
+                    if hold_for_repeat:
+                        cur_norm = self._norm_text(full_response_buffer)
+                        if cur_norm and not self._last_assistant_reply_norm.startswith(cur_norm):
+                            hold_for_repeat = False
+                        else:
+                            continue
 
-                    self._stream_to_text(content)
-                    chunk_buffer += content
-
-                    # Sentence parser to stream to TTS workers early
-                    if re.search(r'[.!?\n]', chunk_buffer):
-                        text_sentence = chunk_buffer.encode('ascii', 'ignore').decode('ascii').strip()
-                        if text_sentence and re.search(r'[a-zA-Z0-9]', text_sentence):
-                            with self.tts_queue_lock:
-                                self.tts_queue.append(text_sentence)
-                        chunk_buffer = ""
+                    _flush_held_to_gui_and_tts()
             finally:
                 if hasattr(stream, "close"):
                     stream.close()
 
-            if chunk_buffer.strip():
-                text_sentence = chunk_buffer.encode('ascii', 'ignore').decode('ascii').strip()
-                if text_sentence and re.search(r'[a-zA-Z0-9]', text_sentence):
-                    with self.tts_queue_lock:
-                        self.tts_queue.append(text_sentence)
-                chunk_buffer = ""
+            if self.interrupted.is_set():
+                self.thinking_sound_active.clear()
+                return False
 
-            if not full_response_buffer.strip() and not self.interrupted.is_set():
+            if not full_response_buffer.strip():
                 print("[LLM] Stream returned empty content — retrying non-streaming...", flush=True)
                 fallback_resp = OLLAMA_CLIENT.chat(
                     model=TEXT_MODEL,
@@ -2178,27 +2758,25 @@ class BotGUI:
                     return False
 
                 full_response_buffer = fallback_clean
-                if full_response_buffer.lstrip().startswith('{'):
+                stripped = full_response_buffer.lstrip()
+                if self._is_action_payload(stripped):
                     is_action_mode = True
                     self.thinking_sound_active.clear()
                 else:
                     self.thinking_sound_active.clear()
-                    self.append_to_text("BOT: ", newline=False)
-                    self.append_to_text(full_response_buffer, newline=True)
-                    with self.tts_queue_lock:
-                        self.tts_queue.append(full_response_buffer)
+                    buffered_gui_chunks = [full_response_buffer]
+                    hold_for_repeat = False
 
             if full_response_buffer.strip():
                 print(f"[LLM] Reply ({len(full_response_buffer)} chars): {full_response_buffer[:200]!r}", flush=True)
 
-            user_norm = self._norm_text(text)
             reply_norm = self._norm_text(full_response_buffer)
             if (not is_action_mode and reply_norm
                     and reply_norm == self._last_assistant_reply_norm
                     and user_norm != self._last_user_text_norm):
                 print("[LLM] Repetition loop detected — clearing context and retrying fresh...", flush=True)
                 self.permanent_memory = [{"role": "system", "content": SYSTEM_PROMPT}]
-                self.session_memory = [user_msg]
+                self.session_memory = []
                 fresh_resp = OLLAMA_CLIENT.chat(
                     model=TEXT_MODEL,
                     messages=[{"role": "system", "content": SYSTEM_PROMPT}, user_msg],
@@ -2209,14 +2787,22 @@ class BotGUI:
                 fresh_clean = fresh_raw.encode('ascii', 'ignore').decode('ascii').strip()
                 if fresh_clean and self._norm_text(fresh_clean) != reply_norm:
                     full_response_buffer = fresh_clean
-                    if full_response_buffer.lstrip().startswith('{'):
+                    buffered_gui_chunks = [full_response_buffer]
+                    chunk_buffer = ""
+                    if self._is_action_payload(full_response_buffer.lstrip()):
                         is_action_mode = True
+                        buffered_gui_chunks.clear()
                     else:
-                        with self.tts_queue_lock:
-                            self.tts_queue.clear()
-                            self.tts_queue.append(full_response_buffer)
-                        self.append_to_text("BOT: ", newline=False)
-                        self.append_to_text(full_response_buffer, newline=True)
+                        self._clear_tts_queue()
+
+            if not is_action_mode and buffered_gui_chunks:
+                _flush_held_to_gui_and_tts()
+
+            if not is_action_mode and chunk_buffer.strip():
+                text_sentence = chunk_buffer.encode('ascii', 'ignore').decode('ascii').strip()
+                if text_sentence and re.search(r'[a-zA-Z0-9]', text_sentence):
+                    self._enqueue_tts(text_sentence)
+                chunk_buffer = ""
 
             if is_action_mode:
                 action_data = self.extract_json_from_text(full_response_buffer)
@@ -2227,8 +2813,7 @@ class BotGUI:
                     self.set_state(BotStates.SPEAKING, "Speaking...")
                     self.append_to_text("BOT: ", newline=False)
                     self.append_to_text(err_reply, newline=True)
-                    with self.tts_queue_lock:
-                        self.tts_queue.append(err_reply)
+                    self._enqueue_tts(err_reply)
                 else:
                     tool_result = self.execute_action_and_get_result(action_data)
 
@@ -2238,9 +2823,8 @@ class BotGUI:
                         self.set_state(BotStates.SPEAKING, "Speaking...")
                         self.append_to_text("BOT: ", newline=False)
                         self.append_to_text(chat_text, newline=True)
-                        with self.tts_queue_lock:
-                            self.tts_queue.append(chat_text)
-                        self.session_memory.append({"role": "assistant", "content": chat_text})
+                        self._enqueue_tts(chat_text)
+                        self._commit_turn(user_msg, chat_text)
                         self._last_assistant_reply_norm = self._norm_text(chat_text)
                         self._last_user_text_norm = user_norm
                         self.save_chat_history()
@@ -2262,8 +2846,7 @@ class BotGUI:
                         self.set_state(BotStates.SPEAKING, "Speaking...")
                         self.append_to_text("BOT: ", newline=False)
                         self.append_to_text(fallback_text, newline=True)
-                        with self.tts_queue_lock:
-                            self.tts_queue.append(fallback_text)
+                        self._enqueue_tts(fallback_text)
                         self._last_assistant_reply_norm = self._norm_text(fallback_text)
                         self._last_user_text_norm = user_norm
                     elif tool_result:
@@ -2272,34 +2855,33 @@ class BotGUI:
                             {"role": "user", "content": f"RESULT: {tool_result}\nUser Question: {text}"}
                         ]
                         self.set_state(BotStates.THINKING, "Reading...")
-                        self.thinking_sound_active.set()
-                        
+                        self._start_thinking_sound()
+
                         final_resp = OLLAMA_CLIENT.chat(model=TEXT_MODEL, messages=summary_prompt, stream=False, options=OLLAMA_OPTIONS)
                         final_text = self._extract_ollama_content(final_resp)
-                        
+
                         self.thinking_sound_active.clear()
                         self.set_state(BotStates.SPEAKING, "Speaking...")
-                        
+
                         self.append_to_text("BOT: ", newline=False)
                         self.append_to_text(final_text, newline=True)
-                        with self.tts_queue_lock:
-                            self.tts_queue.append(final_text)
+                        self._enqueue_tts(final_text)
                         if final_text.strip():
-                            self.session_memory.append({"role": "assistant", "content": final_text})
+                            self._commit_turn(user_msg, final_text)
                             self._last_assistant_reply_norm = self._norm_text(final_text)
                             self._last_user_text_norm = user_norm
             else:
                 if full_response_buffer.strip():
                     self.append_to_text("")
-                    self.session_memory.append({"role": "assistant", "content": full_response_buffer})
+                    self._commit_turn(user_msg, full_response_buffer)
                     self._last_assistant_reply_norm = self._norm_text(full_response_buffer)
                     self._last_user_text_norm = user_norm
-            
+
             self.save_chat_history()
             self.wait_for_tts()
             self.set_state(BotStates.IDLE, "Ready")
             return bool(full_response_buffer.strip())
-                
+
         except Exception as e:
             self.thinking_sound_active.clear()
             print(f"LLM Chat Error: {e}", flush=True)
@@ -2307,70 +2889,134 @@ class BotGUI:
             return False
 
     def wait_for_tts(self):
-        while True:
-            if self.interrupted.is_set() or self.exiting or self.stop_event.is_set():
-                break
-            with self.tts_queue_lock:
-                empty = len(self.tts_queue) == 0
-            if empty and not self.tts_active.is_set():
-                # Let ALSA playback tail finish before reopening microphone
-                time.sleep(0.6)
-                break
-            time.sleep(0.05)
+        with self.tts_cond:
+            while not (self.interrupted.is_set() or self.exiting or self.stop_event.is_set()):
+                if not self.tts_queue and not self.tts_active.is_set():
+                    break
+                self.tts_cond.wait(timeout=0.1)
+        if not (self.interrupted.is_set() or self.exiting or self.stop_event.is_set()):
+            # Let ALSA playback tail finish before reopening microphone
+            self.interrupted.wait(0.6)
 
     def _tts_worker(self):
         while not self.exiting and not self.stop_event.is_set():
-            with self.tts_queue_lock:
-                if self.tts_queue:
-                    full_text = self.tts_queue.pop(0)
-                else:
-                    full_text = None
-            if full_text:
+            with self.tts_cond:
+                while not self.tts_queue and not self.exiting and not self.stop_event.is_set():
+                    self.tts_cond.wait(timeout=0.2)
+                if self.exiting or self.stop_event.is_set():
+                    break
+                full_text = self.tts_queue.popleft()
                 self.tts_active.set()
+                self._sfx_abort.set()
+            try:
                 self.speak(full_text)
-                self.tts_active.clear()
-            else:
-                time.sleep(0.03)
+            finally:
+                with self.tts_cond:
+                    if not self.tts_queue:
+                        self.tts_active.clear()
+                    self.tts_cond.notify_all()
+
+    def _kill_piper(self):
+        proc = getattr(self, "_piper_process", None)
+        self._piper_process = None
+        if proc is None:
+            return
+        for stream_attr in ("stdin", "stdout"):
+            pipe = getattr(proc, stream_attr, None)
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except Exception:
+                    pass
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=0.5)
+            except Exception:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=0.5)
+                except Exception:
+                    pass
+
+    def _drain_piper_stdout(self, max_sec=0.35):
+        """Drains remaining PCM bytes after an interrupt or resets Piper if still streaming."""
+        proc = self._piper_process
+        if proc is None or proc.poll() is not None:
+            return
+        deadline = time.time() + max_sec
+        quiet_ticks = 0
+        while time.time() < deadline and quiet_ticks < 3:
+            rlist, _, _ = select.select([proc.stdout], [], [], 0.02)
+            if not rlist:
+                quiet_ticks += 1
+                continue
+            quiet_ticks = 0
+            chunk = proc.stdout.read1(4096)
+            if not chunk:
+                break
+        else:
+            if time.time() >= deadline:
+                print("[PIPER] Interrupted stream still active; restarting Piper.", flush=True)
+                self._kill_piper()
 
     def _init_piper(self):
-        voice_model = CURRENT_CONFIG.get("voice_model", "piper/en_GB-semaine-medium.onnx")
-        if not os.path.exists("./piper/piper"):
-            print("[PIPER ERROR] ./piper/piper binary not found!", flush=True)
+        piper_bin = _resolve_path("piper/piper")
+        piper_dir = os.path.dirname(piper_bin)
+        voice_model = _resolve_path(CURRENT_CONFIG.get("voice_model", "piper/en_GB-semaine-medium.onnx"))
+        espeak_data = _resolve_path("piper/espeak-ng-data")
+        if not os.path.exists(piper_bin):
+            print(f"[PIPER ERROR] {piper_bin} binary not found!", flush=True)
             return
         if not os.path.exists(voice_model):
             print(f"[PIPER ERROR] Voice model not found: {voice_model}", flush=True)
             return
         try:
-            if self._piper_process and self._piper_process.poll() is None:
-                self._piper_process.terminate()
-            
+            self._kill_piper()
+            env = os.environ.copy()
+            ld_path = env.get("LD_LIBRARY_PATH", "")
+            env["LD_LIBRARY_PATH"] = f"{piper_dir}:{ld_path}" if ld_path else piper_dir
+
+            cmd = [piper_bin, "--model", voice_model, "--output-raw", "--json-input"]
+            if os.path.isdir(espeak_data):
+                cmd.extend(["--espeak_data", espeak_data])
+
             self._piper_process = subprocess.Popen(
-                ["./piper/piper", "--model", voice_model, "--output-raw", "--json-input"],
+                cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL
+                stderr=subprocess.DEVNULL,
+                env=env,
             )
             print("[INIT] Persistent Piper TTS subprocess started.", flush=True)
 
             PIPER_RATE = 22050
+            model_json = f"{voice_model}.json"
+            if os.path.exists(model_json):
+                try:
+                    with open(model_json, "r") as mf:
+                        PIPER_RATE = int(json.load(mf).get("audio", {}).get("sample_rate", PIPER_RATE))
+                except Exception:
+                    pass
+
             use_native_rate = False
             native_rate = 48000
             try:
                 dev_info = sd.query_devices(self._output_device)
                 native_rate = int(dev_info['default_samplerate'])
-            except:
+            except Exception:
                 pass
             try:
                 sd.check_output_settings(device=self._output_device, samplerate=PIPER_RATE, channels=1)
-            except:
+            except Exception:
                 use_native_rate = True
-            
+
             self._piper_rate = PIPER_RATE
             self._piper_native_rate = native_rate
             self._piper_use_native_rate = use_native_rate
         except Exception as e:
             print(f"[PIPER ERROR] Initialization failed: {e}", flush=True)
-            self._piper_process = None
+            self._kill_piper()
 
     def _find_output_device(self):
         """Scans and finds best output hardware. Prefers USB connections."""
@@ -2407,7 +3053,6 @@ class BotGUI:
         return None
 
     def speak(self, text):
-        import json as _json
         text = text.encode('ascii', 'ignore').decode('ascii')
         clean = re.sub(r'[^a-zA-Z0-9\s,.!?:\'\-]', '', text).strip()
         if not clean:
@@ -2415,119 +3060,202 @@ class BotGUI:
 
         print(f"[PIPER] Synthesis text: '{clean}'", flush=True)
 
-        if self._piper_process is None or self._piper_process.poll() is not None:
-            print("[PIPER] Piper process died, restarting...", flush=True)
-            self._init_piper()
-        if self._piper_process is None:
-            return
+        with self._audio_out_lock:
+            if self._piper_process is None or self._piper_process.poll() is not None:
+                print("[PIPER] Piper process died, restarting...", flush=True)
+                self._init_piper()
+            if self._piper_process is None:
+                return
 
-        try:
-            msg = _json.dumps({"text": clean}) + "\n"
-            self._piper_process.stdin.write(msg.encode())
-            self._piper_process.stdin.flush()
+            was_interrupted = False
+            try:
+                msg = json.dumps({"text": clean}) + "\n"
+                self._piper_process.stdin.write(msg.encode())
+                self._piper_process.stdin.flush()
 
-            playback_rate = self._piper_native_rate if self._piper_use_native_rate else self._piper_rate
+                playback_rate = self._piper_native_rate if self._piper_use_native_rate else self._piper_rate
+                step = float(self._piper_rate) / float(playback_rate)
+                prev_sample = None
+                resample_pos = 0.0
+                pending_byte = b""
 
-            with sd.RawOutputStream(samplerate=playback_rate, channels=1, dtype='int16',
-                                    device=self._output_device, latency='high', blocksize=2048) as stream:
-                audio_started = False
-                pre_audio_deadline = time.time() + 3.0
-                post_audio_gap = 0
-                MAX_GAP_TICKS = 25  # 25 * 20ms = 500ms silence flags end of phrase
-
-                while True:
-                    if self.interrupted.is_set() or self.exiting or self.stop_event.is_set():
-                        break
-
-                    if not audio_started and time.time() > pre_audio_deadline:
-                        print("[PIPER] Synthesis timeout — dropping sentence.", flush=True)
-                        break
-
-                    rlist, _, _ = select.select([self._piper_process.stdout], [], [], 0.02)
-                    if not rlist:
-                        if audio_started:
-                            post_audio_gap += 1
-                            if post_audio_gap >= MAX_GAP_TICKS:
-                                break
-                        continue
-
+                with sd.RawOutputStream(samplerate=playback_rate, channels=1, dtype='int16',
+                                        device=self._output_device, latency='high', blocksize=2048) as stream:
+                    audio_started = False
+                    pre_audio_deadline = time.time() + 3.0
                     post_audio_gap = 0
-                    # Use read1 to read whatever is available in the buffer immediately without blocking,
-                    # which prevents stuttering or delayed audio processing in the streaming pipeline.
-                    data = self._piper_process.stdout.read1(4096)
-                    if not data:
-                        if audio_started:
+                    MAX_GAP_TICKS = 25  # 25 * 20ms = 500ms silence flags end of phrase
+
+                    while True:
+                        if self.interrupted.is_set() or self.exiting or self.stop_event.is_set():
+                            was_interrupted = True
                             break
-                        continue
 
-                    audio_chunk = np.frombuffer(data, dtype=np.int16)
-                    if len(audio_chunk) > 0:
-                        if not audio_started:
-                            audio_started = True
-                            self.set_state(BotStates.SPEAKING, "Speaking...")
-                        self.current_volume = np.max(np.abs(audio_chunk))
-                        
-                        if self._piper_use_native_rate:
-                            # Downsample polyphase filtering
-                            from math import gcd
-                            g = gcd(self._piper_native_rate, self._piper_rate)
-                            up, down = self._piper_native_rate // g, self._piper_rate // g
-                            audio_chunk = scipy.signal.resample_poly(audio_chunk, up, down).astype(np.int16)
-                        stream.write(audio_chunk.tobytes())
+                        if not audio_started and time.time() > pre_audio_deadline:
+                            print("[PIPER] Synthesis timeout — dropping sentence.", flush=True)
+                            break
 
-            self.current_volume = 0
-        except Exception as e:
-            print(f"[PIPER ERROR] Synthesis failure: {e}", flush=True)
-            self._piper_process = None
+                        rlist, _, _ = select.select([self._piper_process.stdout], [], [], 0.02)
+                        if not rlist:
+                            if audio_started:
+                                post_audio_gap += 1
+                                if post_audio_gap >= MAX_GAP_TICKS:
+                                    break
+                            continue
+
+                        post_audio_gap = 0
+                        raw_data = self._piper_process.stdout.read1(4096)
+                        if not raw_data:
+                            if audio_started:
+                                break
+                            continue
+
+                        data = pending_byte + raw_data
+                        even_len = len(data) & ~1
+                        pending_byte = data[even_len:]
+                        if even_len == 0:
+                            continue
+
+                        audio_chunk = np.frombuffer(data[:even_len], dtype=np.int16)
+                        if audio_chunk.size > 0:
+                            if not audio_started:
+                                audio_started = True
+                                self.set_state(BotStates.SPEAKING, "Speaking...")
+                            self.current_volume = int(np.max(np.abs(audio_chunk)))
+
+                            if self._piper_use_native_rate:
+                                src = audio_chunk.astype(np.float32)
+                                if prev_sample is not None:
+                                    src = np.concatenate(([prev_sample], src))
+                                else:
+                                    resample_pos = 0.0
+                                n_src = src.size
+                                if n_src >= 2 and resample_pos < n_src - 1:
+                                    out_pos = np.arange(resample_pos, n_src - 1, step, dtype=np.float64)
+                                    if out_pos.size > 0:
+                                        out_f = np.interp(out_pos, np.arange(n_src, dtype=np.float64), src)
+                                        out_pcm = np.clip(np.rint(out_f), -32768, 32767).astype(np.int16)
+                                        stream.write(out_pcm.tobytes())
+                                        resample_pos = float(out_pos[-1] + step) - (n_src - 1)
+                                    else:
+                                        resample_pos -= (n_src - 1)
+                                else:
+                                    resample_pos -= max(0, n_src - 1)
+                                prev_sample = float(src[-1])
+                            else:
+                                stream.write(audio_chunk.tobytes())
+
+                if was_interrupted:
+                    self._drain_piper_stdout()
+                self.current_volume = 0
+            except Exception as e:
+                print(f"[PIPER ERROR] Synthesis failure: {e}", flush=True)
+                self._kill_piper()
+                self.current_volume = 0
 
     def _run_thinking_sound_loop(self):
         time.sleep(0.5)
-        while self.thinking_sound_active.is_set():
-            sound = self.get_random_sound(thinking_sounds_dir)
-            if sound:
-                self.play_sound(sound)
+        while self.thinking_sound_active.is_set() and not self._sfx_abort.is_set():
+            if not self.tts_active.is_set():
+                sound = self.get_random_sound(thinking_sounds_dir)
+                if sound:
+                    self.play_sound(sound, interruptible=True)
             for _ in range(50):
-                if not self.thinking_sound_active.is_set():
+                if not self.thinking_sound_active.is_set() or self._sfx_abort.is_set() or self.exiting or self.stop_event.is_set():
                     return
                 time.sleep(0.1)
 
     def get_random_sound(self, directory):
-        if os.path.exists(directory):
-            files = [f for f in os.listdir(directory) if f.endswith(".wav")]
-            return os.path.join(directory, random.choice(files)) if files else None
+        resolved = _resolve_path(directory)
+        if os.path.exists(resolved):
+            files = [f for f in os.listdir(resolved) if f.lower().endswith(".wav")]
+            return os.path.join(resolved, random.choice(files)) if files else None
         return None
 
-    def play_sound(self, file_path):
+    def play_sound_async(self, file_path, interruptible=True):
+        if not file_path:
+            return
+        threading.Thread(
+            target=self.play_sound,
+            args=(file_path, interruptible),
+            daemon=True,
+            name="SoundEffectThread",
+        ).start()
+
+    def play_sound(self, file_path, interruptible=True):
         if not file_path or not os.path.exists(file_path):
+            return
+        if self.exiting or self.stop_event.is_set():
+            return
+        if interruptible and (self._sfx_abort.is_set() or self.tts_active.is_set() or self.interrupted.is_set()):
             return
         try:
             with wave.open(file_path, 'rb') as wf:
                 file_sr = wf.getframerate()
-                data = wf.readframes(wf.getnframes())
-                audio = np.frombuffer(data, dtype=np.int16)
+                nchannels = wf.getnchannels()
+                sampwidth = wf.getsampwidth()
+                raw_bytes = wf.readframes(wf.getnframes())
+            if not raw_bytes:
+                return
 
-            try:
-                device_info = sd.query_devices(kind='output')
-                native_rate = int(device_info['default_samplerate'])
-            except:
-                native_rate = 48000
+            if sampwidth == 1:
+                audio_f = (np.frombuffer(raw_bytes, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
+            elif sampwidth == 2:
+                audio_f = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+            elif sampwidth == 4:
+                audio_f = np.frombuffer(raw_bytes, dtype=np.int32).astype(np.float32) / 2147483648.0
+            else:
+                return
+
+            if nchannels > 1:
+                audio_f = audio_f.reshape(-1, nchannels).mean(axis=1)
 
             playback_rate = file_sr
             try:
-                sd.check_output_settings(device=None, samplerate=file_sr)
-            except:
-                playback_rate = native_rate
-                num_samples = int(len(audio) * (native_rate / file_sr))
-                audio = scipy.signal.resample(audio, num_samples).astype(np.int16)
+                sd.check_output_settings(device=self._output_device, samplerate=file_sr, channels=1)
+            except Exception:
+                try:
+                    dev_info = sd.query_devices(self._output_device)
+                    playback_rate = int(dev_info['default_samplerate'])
+                except Exception:
+                    playback_rate = 48000
+                if playback_rate != file_sr:
+                    from math import gcd
+                    g = gcd(int(file_sr), int(playback_rate))
+                    audio_f = scipy.signal.resample_poly(
+                        audio_f, int(playback_rate) // g, int(file_sr) // g
+                    ).astype(np.float32)
 
-            sd.play(audio, playback_rate)
-            sd.wait()
-        except:
-            pass
+            pcm = np.clip(np.rint(audio_f * 32767.0), -32768, 32767).astype(np.int16)
+
+            with self._audio_out_lock:
+                if self.exiting or self.stop_event.is_set():
+                    return
+                if interruptible and (self._sfx_abort.is_set() or self.tts_active.is_set() or self.interrupted.is_set()):
+                    return
+                with sd.RawOutputStream(
+                    samplerate=playback_rate,
+                    channels=1,
+                    dtype='int16',
+                    device=self._output_device,
+                    latency='high',
+                    blocksize=2048,
+                ) as stream:
+                    chunk_sz = 2048
+                    for i in range(0, pcm.size, chunk_sz):
+                        if self.exiting or self.stop_event.is_set():
+                            break
+                        if interruptible and (self._sfx_abort.is_set() or self.tts_active.is_set() or self.interrupted.is_set()):
+                            break
+                        stream.write(pcm[i:i + chunk_sz].tobytes())
+        except Exception as e:
+            print(f"[AUDIO WARNING] Sound effect playback failed ({file_path}): {e}", flush=True)
 
     # --- MEMORY STACK LOAD/SAVE ---
 
     def load_chat_history(self):
+        if not bool(CURRENT_CONFIG.get("chat_memory", True)):
+            return [{"role": "system", "content": SYSTEM_PROMPT}]
         if os.path.exists(MEMORY_FILE):
             try:
                 with open(MEMORY_FILE, "r") as f:
@@ -2546,18 +3274,23 @@ class BotGUI:
                                     return [{"role": "system", "content": SYSTEM_PROMPT}]
                                 prev_a = cur_a
                         return [{"role": "system", "content": SYSTEM_PROMPT}] + cleaned
-            except:
+            except Exception:
                 pass
         return [{"role": "system", "content": SYSTEM_PROMPT}]
 
     def save_chat_history(self):
-        full = self.permanent_memory + self.session_memory
-        conv = full[1:]
-        if len(conv) > 6:
-            conv = conv[-6:]
+        if not getattr(self, "chat_memory_enabled", bool(CURRENT_CONFIG.get("chat_memory", True))):
+            conv = []
+        else:
+            full = self.permanent_memory + self.session_memory
+            conv = full[1:]
+            if len(conv) > 6:
+                conv = conv[-6:]
+        tmp_path = f"{MEMORY_FILE}.tmp"
         try:
-            with open(MEMORY_FILE, "w") as f:
-                json.dump([full[0]] + conv, f, indent=4)
+            with open(tmp_path, "w") as f:
+                json.dump([{"role": "system", "content": SYSTEM_PROMPT}] + conv, f, indent=4)
+            os.replace(tmp_path, MEMORY_FILE)
         except Exception as e:
             print(f"[MEM ERROR] Save chat history failed: {e}", flush=True)
 

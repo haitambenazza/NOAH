@@ -1,9 +1,8 @@
 # =========================================================================
-# Be More Agent (BMO) — Necessary Dependencies for main.py (Raspberry Pi 4)
-# Filtered from old.txt + required runtime imports in main.py
+# Be More Agent (BMO) — Necessary Dependencies for main.py (Raspberry Pi 4/5)
 # =========================================================================
 
-# --- Necessary Packages from old.txt (Raspberry Pi 4 Base & Hardware) ---
+# --- Raspberry Pi Base & Hardware ---
 pillow>=11.1.0
 numpy>=2.2.4
 gpiozero>=2.0.1
@@ -12,18 +11,15 @@ rpi-lgpio>=0.6
 picamera2>=0.3.36
 av>=13,<18
 
-# --- Core Audio & Signal Processing (Required by main.py) ---
+# --- Core Audio & Signal Processing ---
 sounddevice>=0.4.6
 scipy>=1.10.0
 
-# --- AI, Wake Word & Speech-to-Text (Required by main.py) ---
-ollama>=0.3.0
+# --- AI, Wake Word & Speech-to-Text ---
 onnxruntime>=1.16.0
 requests>=2.32.3
-tqdm>=4.67.1
-scikit-learn>=1.3.0
 faster-whisper>=1.0.0
 
-# --- Web Search & Computer Vision (Required by main.py) ---
+# --- Web Search & Computer Vision ---
 duckduckgo-search>=6.0.0
 opencv-python>=4.8.0
