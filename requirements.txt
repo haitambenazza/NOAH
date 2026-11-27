@@ -1,15 +1,14 @@
 # =========================================================================
-# Be More Agent (BMO) — Necessary Dependencies for main.py (Raspberry Pi 4/5)
+# Be More Agent (BMO) — Pip Dependencies for main.py (Raspberry Pi 4/5)
+# Note: Raspberry Pi system/C bindings (python3-tk, python3-pil.imagetk,
+# python3-picamera2, python3-lgpio, libav) are installed via apt in setup.sh
+# and exposed via `python3 -m venv --system-site-packages .venv`.
 # =========================================================================
 
-# --- Raspberry Pi Base & Hardware ---
-pillow>=11.1.0
-numpy>=2.2.4
-gpiozero>=2.0.1
-lgpio>=0.2.2.0
-rpi-lgpio>=0.6
-picamera2>=0.3.36
-av>=13,<18
+# --- Core UI & Numerics ---
+pillow>=10.0.0
+numpy>=1.26.0
+gpiozero>=2.0.0
 
 # --- Core Audio & Signal Processing ---
 sounddevice>=0.4.6
@@ -17,7 +16,7 @@ scipy>=1.10.0
 
 # --- AI, Wake Word & Speech-to-Text ---
 onnxruntime>=1.16.0
-requests>=2.32.3
+requests>=2.31.0
 faster-whisper>=1.0.0
 
 # --- Web Search & Computer Vision ---

@@ -3,17 +3,24 @@
 #  A Local, Offline-First AI Agent & Face Tracker for Raspberry Pi 4
 # =========================================================================
 
+import os
+import sys
+
+# Ensure system apt packages (PIL/ImageTk, tkinter, libcamera, picamera2, lgpio)
+# are visible even inside a virtualenv created without --system-site-packages.
+_SYS_DIST_PACKAGES = "/usr/lib/python3/dist-packages"
+if os.path.isdir(_SYS_DIST_PACKAGES) and _SYS_DIST_PACKAGES not in sys.path:
+    sys.path.append(_SYS_DIST_PACKAGES)
+
 import tkinter as tk
 from tkinter import ttk
 from PIL import Image, ImageTk
 import threading
 import time
 import json
-import os
 import subprocess
 import random
 import re
-import sys
 import select
 import traceback
 import atexit
@@ -81,11 +88,6 @@ except ImportError:
     print("[INIT WARNING] opencv-python not installed — Camera & Face Detection disabled.")
 
 # --- RASPBERRY PI HARDWARE ---
-# Ensure system apt packages (libcamera / picamera2 / lgpio) are visible even inside a virtualenv
-_SYS_DIST_PACKAGES = "/usr/lib/python3/dist-packages"
-if os.path.isdir(_SYS_DIST_PACKAGES) and _SYS_DIST_PACKAGES not in sys.path:
-    sys.path.append(_SYS_DIST_PACKAGES)
-
 try:
     from picamera2 import Picamera2
     PICAMERA_AVAILABLE = True
