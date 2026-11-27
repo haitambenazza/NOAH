@@ -1311,7 +1311,7 @@ class CameraPipeline:
 # =========================================================================
 
 class BotGUI:
-    BG_WIDTH, BG_HEIGHT = 1920, 1200 
+    BG_WIDTH, BG_HEIGHT = 1280, 720
     CAM_W, CAM_H = 240, 180  # PIP overlay dimensions
 
     def __init__(self, master):
