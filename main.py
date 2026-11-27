@@ -141,9 +141,12 @@ DEFAULT_CONFIG = {
     "system_prompt_extras": "",
     "input_device": None,
     "input_sample_rate": None,
-    "silence_duration": 0.9,
-    "no_speech_timeout": 4.0,
-    "max_record_time": 10.0,
+    "silence_duration": 1.5,
+    "no_speech_timeout": 8.0,
+    "max_record_time": 15.0,
+    "wake_button_duration": 8.0,
+    "wake_silence_duration": 0.75,
+    "wake_max_burst": 5.0,
     "servo_gpio1": 12,
     "servo_gpio2": 13,
     "camera_width": 640,
@@ -724,15 +727,25 @@ class KnowledgeBase:
             used_chars += len(entry) + 2
         return selected
 
-    def build_system_prompt(self, query="", top_k=3, extras=""):
+    def build_core_prompt(self, extras=""):
         core = self.get_core_prompt() or FALLBACK_SYSTEM_PROMPT
         parts = [core]
         if extras and str(extras).strip():
             parts.append(str(extras).strip())
         parts.append(f"Today's date: {datetime.date.today().isoformat()}.")
+        return "\n\n".join(parts)
+
+    def build_query_context(self, query="", top_k=3):
         snippets = self.retrieve(query, top_k=top_k)
-        if snippets:
-            parts.append("# Relevant Knowledge\n" + "\n\n".join(snippets))
+        if not snippets:
+            return ""
+        return "# Relevant Knowledge\n" + "\n\n".join(snippets)
+
+    def build_system_prompt(self, query="", top_k=3, extras=""):
+        parts = [self.build_core_prompt(extras=extras)]
+        ctx = self.build_query_context(query=query, top_k=top_k)
+        if ctx:
+            parts.append(ctx)
         return "\n\n".join(parts)
 
 
@@ -1586,7 +1599,7 @@ class BotGUI:
         self._cancel_auto_stop_timer()
         self.idle_event.clear()
         self.interrupted.clear()
-        self.ptt_auto_stop_duration = 5.0
+        self.ptt_auto_stop_duration = float(CURRENT_CONFIG.get("wake_button_duration", 8.0))
         self.recording_active.set()
         self.ptt_event.set()
 
@@ -2073,7 +2086,10 @@ class BotGUI:
             try:
                 OLLAMA_CLIENT.chat(
                     model=TEXT_MODEL,
-                    messages=[{"role": "user", "content": "hi"}],
+                    messages=[
+                        {"role": "system", "content": self.build_core_system_prompt()},
+                        {"role": "user", "content": "hello"},
+                    ],
                     stream=False,
                     options=OLLAMA_OPTIONS,
                 )
@@ -2272,8 +2288,8 @@ class BotGUI:
         calib_chunks_needed = max(3, int(round(0.3 * input_rate / blocksize)))
         preroll_max_chunks = max(4, int(round(0.45 * input_rate / blocksize)))
         min_speech_chunks = max(2, int(round(0.12 * input_rate / blocksize)))
-        SILENCE_END_SEC = 0.55
-        MAX_BURST_SEC = 4.0
+        SILENCE_END_SEC = float(CURRENT_CONFIG.get("wake_silence_duration", 0.75))
+        MAX_BURST_SEC = float(CURRENT_CONFIG.get("wake_max_burst", 5.0))
 
         calib_rms = []
         preroll = deque(maxlen=preroll_max_chunks)
@@ -2872,12 +2888,32 @@ class BotGUI:
     def _strip_speaker_prefix(text):
         return re.sub(r"^\s*(?:you|assistant|bot|noah)\s*:\s*", "", str(text or ""), flags=re.IGNORECASE)
 
+    def build_core_system_prompt(self):
+        return KNOWLEDGE_BASE.build_core_prompt(
+            extras=CURRENT_CONFIG.get("system_prompt_extras", ""),
+        )
+
     def build_system_prompt(self, query=""):
         return KNOWLEDGE_BASE.build_system_prompt(
             query=query,
             top_k=int(CURRENT_CONFIG.get("knowledge_top_k", 3)),
             extras=CURRENT_CONFIG.get("system_prompt_extras", ""),
         )
+
+    def _build_turn_payload_messages(self, text):
+        live_sys = self.build_core_system_prompt()
+        ctx = KNOWLEDGE_BASE.build_query_context(
+            query=text,
+            top_k=int(CURRENT_CONFIG.get("knowledge_top_k", 3)),
+        )
+        outbound_user = (
+            {"role": "user", "content": f"Relevant knowledge:\n{ctx}\n\nUser: {text}"}
+            if ctx
+            else {"role": "user", "content": text}
+        )
+        if self.chat_memory_enabled:
+            return live_sys, [{"role": "system", "content": live_sys}] + self.permanent_memory + self.session_memory + [outbound_user]
+        return live_sys, [{"role": "system", "content": live_sys}, outbound_user]
 
     def _commit_turn(self, user_msg, assistant_text):
         if not self.chat_memory_enabled or not str(assistant_text).strip():
@@ -2912,12 +2948,8 @@ class BotGUI:
 
         self.set_state(BotStates.THINKING, "Thinking...")
 
-        live_sys = self.build_system_prompt(text)
         user_msg = {"role": "user", "content": text}
-        if self.chat_memory_enabled:
-            messages = [{"role": "system", "content": live_sys}] + self.permanent_memory + self.session_memory + [user_msg]
-        else:
-            messages = [{"role": "system", "content": live_sys}, user_msg]
+        live_sys, messages = self._build_turn_payload_messages(text)
 
         user_norm = self._norm_text(text)
         self._start_thinking_sound()
