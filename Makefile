@@ -7,6 +7,7 @@ PIP := $(VENV)/bin/pip
 venv:
 	python3 -m venv --system-site-packages $(VENV)
 	$(PIP) install --upgrade pip
+	$(PIP) uninstall -y duckduckgo-search >/dev/null 2>&1 || true
 	$(PIP) install -r requirements.txt
 	$(PIP) install --no-deps "openwakeword>=0.6.0"
 	$(PYTHON) -c "import importlib.metadata as m, pathlib; p = pathlib.Path(m.distribution('openwakeword')._path) / 'METADATA'; p.write_text('\n'.join(l for l in p.read_text().splitlines() if 'tflite-runtime' not in l and 'ai-edge-litert' not in l) + '\n')"

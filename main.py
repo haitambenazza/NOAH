@@ -152,13 +152,22 @@ DEFAULT_CONFIG = {
     "camera_flip": True,
     "use_yunet": True,
     "debug_save_wav": False,
+    "knowledge_dir": "knowledge",
+    "knowledge_top_k": 3,
+    "max_history_turns": 6,
 }
 
 # LLM SETTINGS (Hailo-10H NPU via hailo-ollama)
 OLLAMA_OPTIONS = {
-    'temperature': 0.7,
-    'top_k': 40,
-    'top_p': 0.9,
+    'temperature': 0.35,
+    'top_k': 20,
+    'top_p': 0.85,
+    'repeat_penalty': 1.15,
+}
+OLLAMA_FACTUAL_OPTIONS = {
+    'temperature': 0.1,
+    'top_k': 10,
+    'top_p': 0.8,
     'repeat_penalty': 1.15,
 }
 
@@ -366,10 +375,19 @@ class HailoOllamaClient:
             for m in messages
             if m.get("content") is not None and str(m.get("content", "")).strip() != ""
         ]
-        if len(clean_messages) > 7 and clean_messages[0]["role"] == "system":
-            clean_messages = [clean_messages[0]] + clean_messages[-6:]
-        elif len(clean_messages) > 6 and (not clean_messages or clean_messages[0]["role"] != "system"):
-            clean_messages = clean_messages[-6:]
+        max_msgs = max(2, int(CURRENT_CONFIG.get("max_history_turns", 6)) * 2)
+        if len(clean_messages) > (max_msgs + 1) and clean_messages[0]["role"] == "system":
+            clean_messages = [clean_messages[0]] + clean_messages[-max_msgs:]
+        elif len(clean_messages) > max_msgs and (not clean_messages or clean_messages[0]["role"] != "system"):
+            clean_messages = clean_messages[-max_msgs:]
+
+        # Keep prompt safely inside Hailo-10H's compiled 2048-token context window
+        max_prompt_chars = 5600
+        start_idx = 1 if (clean_messages and clean_messages[0]["role"] == "system") else 0
+        while len(clean_messages) - start_idx > 2 and sum(len(m["content"]) for m in clean_messages) > max_prompt_chars:
+            clean_messages.pop(start_idx)
+            if len(clean_messages) - start_idx > 2:
+                clean_messages.pop(start_idx)
 
         payload = {
             "model": str(model),
@@ -531,36 +549,194 @@ class BotStates:
     ERROR = "error"
     WARMUP = "warmup"
 
-# --- SYSTEM PROMPT ---
-BASE_SYSTEM_PROMPT = """You are a helpful robot assistant running on a Raspberry Pi.
-Personality: Cute, helpful, robot.
-Style: Short sentences. Enthusiastic. Plain text only - NO emojis, NO special symbols.
+# --- DYNAMIC KNOWLEDGE & PROMPT LOADER ---
+FALLBACK_SYSTEM_PROMPT = "You are a helpful voice assistant. Reply in short plain-text sentences."
 
-INSTRUCTIONS:
-- For standard conversation, reply with plain text only. Do NOT add any prefix like "Normal Text:" or "You:".
-- If the user asks for a physical action (time, search, photo/what you see), output a single JSON object. Do NOT wrap it in markdown or prefix it with text.
 
-### EXAMPLES ###
+class KnowledgeBase:
+    """Hot-reloading Markdown knowledge loader: pinned core.md + BM25 section retrieval."""
 
-User: What time is it?
-You: {"action": "get_time", "value": "now"}
+    _STOPWORDS = frozenset({
+        "a", "an", "and", "are", "as", "at", "be", "but", "by", "can", "do",
+        "for", "from", "had", "has", "have", "he", "her", "his", "how", "in",
+        "is", "it", "its", "of", "on", "or", "our", "she", "that", "the",
+        "their", "them", "they", "this", "to", "was", "we", "were", "what",
+        "when", "where", "which", "with", "you", "your",
+    })
+    _SELF_TRIGGERS = frozenset({"i", "me", "my", "mine", "myself", "who"})
+    _SELF_EXPANSION = ("owner", "profile", "projects", "interests", "preferences")
 
-User: What do you see?
-You: {"action": "describe_view", "value": "environment"}
+    def __init__(self, knowledge_dir, core_filename="core.md", max_core_chars=1400, max_context_chars=1100):
+        self.knowledge_dir = knowledge_dir
+        self.core_filename = core_filename
+        self.max_core_chars = max_core_chars
+        self.max_context_chars = max_context_chars
+        self._lock = threading.Lock()
+        self._mtimes = {}
+        self._core_text = ""
+        self._chunks = []
 
-User: Look at this.
-You: {"action": "describe_view", "value": "target"}
+    @staticmethod
+    def _strip_comments(text):
+        return re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL).strip()
 
-User: Hello!
-You: Hi! I am ready to help!
+    @classmethod
+    def _tokenize(cls, text):
+        tokens = []
+        for w in re.findall(r"[a-z0-9]+", str(text).lower()):
+            if w in cls._STOPWORDS:
+                continue
+            if len(w) > 4 and w.endswith("s") and not w.endswith("ss"):
+                w = w[:-1]
+            tokens.append(w)
+        return tokens
 
-User: Search for news about robots.
-You: {"action": "search_web", "value": "robots news"}
+    @staticmethod
+    def _split_markdown_sections(file_stem, text):
+        sections = []
+        current_heading = file_stem
+        buf = []
+        for line in text.splitlines():
+            heading_m = re.match(r"^(#{1,3})\s+(.+)$", line.strip())
+            if heading_m:
+                body = "\n".join(buf).strip()
+                if body:
+                    sections.append((current_heading, body))
+                title = heading_m.group(2).strip()
+                current_heading = title if title.lower() == file_stem.lower() else f"{file_stem} > {title}"
+                buf = []
+            else:
+                buf.append(line)
+        body = "\n".join(buf).strip()
+        if body:
+            sections.append((current_heading, body))
+        return sections
 
-### END EXAMPLES ###
-"""
+    def _scan_files(self):
+        if not self.knowledge_dir or not os.path.isdir(self.knowledge_dir):
+            return {}
+        found = {}
+        for root, _, files in os.walk(self.knowledge_dir):
+            for fname in sorted(files):
+                if fname.lower().endswith(".md"):
+                    fpath = os.path.join(root, fname)
+                    try:
+                        found[fpath] = os.path.getmtime(fpath)
+                    except OSError:
+                        pass
+        return found
 
-SYSTEM_PROMPT = BASE_SYSTEM_PROMPT + "\n\n" + CURRENT_CONFIG.get("system_prompt_extras", "")
+    def _reload_if_needed(self):
+        current_mtimes = self._scan_files()
+        if current_mtimes == self._mtimes:
+            return
+        core_text = ""
+        chunks = []
+        core_lower = self.core_filename.lower()
+        for fpath in sorted(current_mtimes):
+            try:
+                with open(fpath, "r", encoding="utf-8") as f:
+                    raw = self._strip_comments(f.read())
+            except OSError:
+                continue
+            if not raw:
+                continue
+            rel = os.path.relpath(fpath, self.knowledge_dir)
+            if rel.replace("\\", "/").lower() == core_lower:
+                core_text = raw[:self.max_core_chars].strip()
+                continue
+            stem = os.path.splitext(os.path.basename(fpath))[0].replace("_", " ").replace("-", " ").title()
+            for heading, body in self._split_markdown_sections(stem, raw):
+                h_tokens = self._tokenize(heading)
+                b_tokens = self._tokenize(body)
+                all_tokens = h_tokens + b_tokens
+                if all_tokens:
+                    chunks.append({
+                        "title": heading,
+                        "body": body,
+                        "title_tokens": set(h_tokens),
+                        "tokens": all_tokens,
+                    })
+        self._mtimes = current_mtimes
+        self._core_text = core_text
+        self._chunks = chunks
+        print(f"[KNOWLEDGE] Loaded core={len(core_text)} chars, sections={len(chunks)} from {self.knowledge_dir}", flush=True)
+
+    def get_core_prompt(self):
+        with self._lock:
+            self._reload_if_needed()
+            return self._core_text
+
+    def retrieve(self, query, top_k=3):
+        if not query or top_k <= 0:
+            return []
+        with self._lock:
+            self._reload_if_needed()
+            chunks = list(self._chunks)
+        if not chunks:
+            return []
+
+        import math
+        q_raw = re.findall(r"[a-z0-9]+", str(query).lower())
+        q_tokens = self._tokenize(query)
+        if any(tok in self._SELF_TRIGGERS for tok in q_raw):
+            q_tokens.extend(self._SELF_EXPANSION)
+        if not q_tokens:
+            return []
+
+        n_docs = len(chunks)
+        avg_len = sum(len(c["tokens"]) for c in chunks) / max(1, n_docs)
+        df = {}
+        for c in chunks:
+            for tok in set(c["tokens"]):
+                df[tok] = df.get(tok, 0) + 1
+
+        k1, b = 1.5, 0.75
+        scored = []
+        for idx, c in enumerate(chunks):
+            tf_map = {}
+            for tok in c["tokens"]:
+                tf_map[tok] = tf_map.get(tok, 0) + 1
+            doc_len = len(c["tokens"])
+            score = 0.0
+            for q in set(q_tokens):
+                tf = tf_map.get(q, 0)
+                if tf > 0:
+                    idf = math.log(1.0 + (n_docs - df[q] + 0.5) / (df[q] + 0.5))
+                    denom = tf + k1 * (1.0 - b + b * (doc_len / max(1.0, avg_len)))
+                    score += idf * ((tf * (k1 + 1.0)) / denom)
+                if q in c["title_tokens"]:
+                    score += 2.5
+            if score > 0.0:
+                scored.append((score, -idx, c))
+
+        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        selected = []
+        used_chars = 0
+        for _, _, c in scored[:top_k]:
+            entry = f"[{c['title']}]\n{c['body']}"
+            if used_chars + len(entry) > self.max_context_chars:
+                remaining = self.max_context_chars - used_chars
+                if remaining > 80:
+                    selected.append(entry[:remaining].rsplit(" ", 1)[0] + "...")
+                break
+            selected.append(entry)
+            used_chars += len(entry) + 2
+        return selected
+
+    def build_system_prompt(self, query="", top_k=3, extras=""):
+        core = self.get_core_prompt() or FALLBACK_SYSTEM_PROMPT
+        parts = [core]
+        if extras and str(extras).strip():
+            parts.append(str(extras).strip())
+        parts.append(f"Today's date: {datetime.date.today().isoformat()}.")
+        snippets = self.retrieve(query, top_k=top_k)
+        if snippets:
+            parts.append("# Relevant Knowledge\n" + "\n\n".join(snippets))
+        return "\n\n".join(parts)
+
+
+KNOWLEDGE_BASE = KnowledgeBase(_resolve_path(CURRENT_CONFIG.get("knowledge_dir", "knowledge")))
 
 # Sound Directories
 greeting_sounds_dir = _resolve_path("sounds/greeting_sounds")
@@ -1633,6 +1809,50 @@ class BotGUI:
                     continue
         return None
 
+    @staticmethod
+    def _filter_and_rank_search_results(query, raw_results, max_keep=3):
+        """Filters out spam/non-ASCII noise and ranks snippets by query keyword overlap."""
+        if not raw_results:
+            return []
+        stopwords = {
+            "the", "and", "for", "with", "that", "this", "from", "what", "when",
+            "where", "which", "who", "how", "are", "was", "were", "have", "has",
+            "about", "into", "news", "latest", "today", "current", "search",
+        }
+        query_terms = [
+            w for w in re.findall(r"[a-z0-9]+", str(query).lower())
+            if len(w) >= 3 and w not in stopwords
+        ]
+        ascii_query = all(ord(c) < 128 for c in str(query))
+
+        scored = []
+        for idx, r in enumerate(raw_results):
+            if not isinstance(r, dict):
+                continue
+            title = " ".join(str(r.get("title") or "").split())
+            body = " ".join(str(r.get("body") or r.get("snippet") or "").split())
+            date_str = " ".join(str(r.get("date") or "").split())
+            combined = f"{title} {body}".strip()
+            if len(body) < 25:
+                continue
+            if ascii_query and combined:
+                non_ascii = sum(1 for ch in combined if ord(ch) > 127)
+                if (non_ascii / len(combined)) > 0.15:
+                    continue
+
+            title_low = title.lower()
+            body_low = body.lower()
+            overlap = 0
+            for term in query_terms:
+                if term in title_low:
+                    overlap += 2
+                elif term in body_low:
+                    overlap += 1
+            scored.append((overlap, -idx, {"title": title or "No Title", "body": body[:280], "date": date_str}))
+
+        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return [item[2] for item in scored[:max_keep]]
+
     def execute_action_and_get_result(self, action_data):
         raw_action = str(action_data.get("action", "")).lower().strip()
         value = action_data.get("value") or action_data.get("query")
@@ -1675,11 +1895,11 @@ class BotGUI:
                 return "CHAT_FALLBACK::My camera is currently inactive or warming up."
 
         elif action == "search_web":
-            if not DDGS_AVAILABLE:
-                return "SEARCH_ERROR"
             query = str(value).strip() if value is not None else ""
             if not query:
                 return "INVALID_ACTION"
+            if not DDGS_AVAILABLE:
+                return "SEARCH_ERROR"
             print(f"Searching DuckDuckGo for: '{query}'...", flush=True)
             wants_news = (
                 raw_action in ("news", "search_news")
@@ -1687,26 +1907,47 @@ class BotGUI:
             )
             search_order = ("news", "text") if wants_news else ("text", "news")
             try:
-                with DDGS() as ddgs:
-                    results = []
+                ddgs = DDGS()
+                try:
+                    clean_results = []
                     for mode in search_order:
                         try:
                             fn = ddgs.news if mode == "news" else ddgs.text
-                            results = list(fn(query, region='us-en', max_results=1))
-                            if results:
-                                print(f"[SEARCH] Found {mode.title()}: {results[0].get('title')}", flush=True)
+                            try:
+                                kwargs = {"region": "us-en", "safesearch": "moderate", "max_results": 6}
+                                if mode == "text":
+                                    kwargs["backend"] = "auto"
+                                raw_results = list(fn(query, **kwargs))
+                            except TypeError:
+                                raw_results = list(fn(query, region="us-en", max_results=6))
+                            clean_results = self._filter_and_rank_search_results(query, raw_results, max_keep=3)
+                            if clean_results:
+                                print(f"[SEARCH] Kept {len(clean_results)} {mode} results (top: {clean_results[0]['title']})", flush=True)
                                 break
                         except Exception as e:
                             print(f"[SEARCH DEBUG] {mode.title()} query failed: {e}", flush=True)
+                finally:
+                    if hasattr(ddgs, "close"):
+                        try:
+                            ddgs.close()
+                        except Exception:
+                            pass
+                    elif hasattr(ddgs, "__exit__"):
+                        try:
+                            ddgs.__exit__(None, None, None)
+                        except Exception:
+                            pass
 
-                    if results:
-                        r = results[0]
-                        title = r.get('title', 'No Title')
-                        body = r.get('body', r.get('snippet', 'No Body'))
-                        return f"SEARCH RESULTS for '{query}':\nTitle: {title}\nSnippet: {body[:300]}"
-                    else:
-                        print("[SEARCH] Returned 0 results.", flush=True)
-                        return "SEARCH_EMPTY"
+                if clean_results:
+                    formatted = []
+                    for i, r in enumerate(clean_results, 1):
+                        date_part = f" ({r['date']})" if r.get("date") else ""
+                        formatted.append(f"[{i}] Title: {r['title']}{date_part}\nSnippet: {r['body']}")
+                    ctx = f"SEARCH RESULTS for '{query}':\n" + "\n".join(formatted)
+                    print(f"[SEARCH] Context:\n{ctx}", flush=True)
+                    return ctx
+                print("[SEARCH] Returned 0 clean results.", flush=True)
+                return "SEARCH_EMPTY"
             except Exception as e:
                 print(f"[SEARCH ERROR] Connection/API error: {e}", flush=True)
                 return "SEARCH_ERROR"
@@ -2627,13 +2868,25 @@ class BotGUI:
             self.tts_queue.clear()
             self.tts_cond.notify_all()
 
+    @staticmethod
+    def _strip_speaker_prefix(text):
+        return re.sub(r"^\s*(?:you|assistant|bot|noah)\s*:\s*", "", str(text or ""), flags=re.IGNORECASE)
+
+    def build_system_prompt(self, query=""):
+        return KNOWLEDGE_BASE.build_system_prompt(
+            query=query,
+            top_k=int(CURRENT_CONFIG.get("knowledge_top_k", 3)),
+            extras=CURRENT_CONFIG.get("system_prompt_extras", ""),
+        )
+
     def _commit_turn(self, user_msg, assistant_text):
         if not self.chat_memory_enabled or not str(assistant_text).strip():
             return
+        max_msgs = max(2, int(CURRENT_CONFIG.get("max_history_turns", 6)) * 2)
         self.session_memory.append(user_msg)
         self.session_memory.append({"role": "assistant", "content": str(assistant_text)})
-        if len(self.session_memory) > 6:
-            self.session_memory = self.session_memory[-6:]
+        if len(self.session_memory) > max_msgs:
+            self.session_memory = self.session_memory[-max_msgs:]
 
     def _start_thinking_sound(self):
         self._sfx_abort.clear()
@@ -2647,7 +2900,7 @@ class BotGUI:
     def chat_and_respond(self, text):
         if "forget everything" in text.lower() or "reset memory" in text.lower():
             self.session_memory = []
-            self.permanent_memory = [{"role": "system", "content": SYSTEM_PROMPT}]
+            self.permanent_memory = []
             self._last_assistant_reply_norm = ""
             self._last_user_text_norm = ""
             self.save_chat_history()
@@ -2659,11 +2912,12 @@ class BotGUI:
 
         self.set_state(BotStates.THINKING, "Thinking...")
 
+        live_sys = self.build_system_prompt(text)
         user_msg = {"role": "user", "content": text}
         if self.chat_memory_enabled:
-            messages = self.permanent_memory + self.session_memory + [user_msg]
+            messages = [{"role": "system", "content": live_sys}] + self.permanent_memory + self.session_memory + [user_msg]
         else:
-            messages = [{"role": "system", "content": SYSTEM_PROMPT}, user_msg]
+            messages = [{"role": "system", "content": live_sys}, user_msg]
 
         user_norm = self._norm_text(text)
         self._start_thinking_sound()
@@ -2677,14 +2931,18 @@ class BotGUI:
 
         def _flush_held_to_gui_and_tts():
             nonlocal chunk_buffer, bot_label_written
-            if not bot_label_written:
-                self.append_to_text("BOT: ", newline=False)
-                bot_label_written = True
             if buffered_gui_chunks:
                 joined = "".join(buffered_gui_chunks)
                 buffered_gui_chunks.clear()
+                if not bot_label_written:
+                    joined = self._strip_speaker_prefix(joined)
+                    self.append_to_text("BOT: ", newline=False)
+                    bot_label_written = True
                 self._stream_to_text(joined)
                 chunk_buffer += joined
+            elif not bot_label_written:
+                self.append_to_text("BOT: ", newline=False)
+                bot_label_written = True
             sentences, chunk_buffer = self._split_complete_sentences(chunk_buffer)
             for sent in sentences:
                 clean_s = sent.encode('ascii', 'ignore').decode('ascii').strip()
@@ -2777,11 +3035,11 @@ class BotGUI:
                     and reply_norm == self._last_assistant_reply_norm
                     and user_norm != self._last_user_text_norm):
                 print("[LLM] Repetition loop detected — clearing context and retrying fresh...", flush=True)
-                self.permanent_memory = [{"role": "system", "content": SYSTEM_PROMPT}]
+                self.permanent_memory = []
                 self.session_memory = []
                 fresh_resp = OLLAMA_CLIENT.chat(
                     model=TEXT_MODEL,
-                    messages=[{"role": "system", "content": SYSTEM_PROMPT}, user_msg],
+                    messages=[{"role": "system", "content": live_sys}, user_msg],
                     stream=False,
                     options=OLLAMA_OPTIONS,
                 )
@@ -2837,7 +3095,7 @@ class BotGUI:
                     if tool_result == "INVALID_ACTION":
                         fallback_text = "I am not sure how to do that."
                     elif tool_result == "SEARCH_EMPTY":
-                        fallback_text = "I searched, but I couldn't find any news about that."
+                        fallback_text = "I searched online, but couldn't find a clear answer for that."
                     elif tool_result == "SEARCH_ERROR":
                         fallback_text = "I cannot reach the internet right now."
                     else:
@@ -2852,15 +3110,34 @@ class BotGUI:
                         self._last_assistant_reply_norm = self._norm_text(fallback_text)
                         self._last_user_text_norm = user_norm
                     elif tool_result:
+                        today_str = datetime.date.today().isoformat()
+                        search_val = str(action_data.get("value") or action_data.get("query") or text).strip()
                         summary_prompt = [
-                            {"role": "system", "content": "Summarize this result in one short sentence."},
-                            {"role": "user", "content": f"RESULT: {tool_result}\nUser Question: {text}"}
+                            {
+                                "role": "system",
+                                "content": (
+                                    f"Today's date is {today_str}. "
+                                    "Answer the question in 1 or 2 short plain-text sentences using ONLY facts explicitly stated in the SEARCH RESULTS. "
+                                    "Do NOT guess, assume, or invent numbers, names, or dates. "
+                                    "If the SEARCH RESULTS do not contain the answer, say: I searched online, but could not find the exact answer."
+                                ),
+                            },
+                            {"role": "user", "content": f"{tool_result}\n\nSearch Query: {search_val}\nUser Message: {text}"}
                         ]
                         self.set_state(BotStates.THINKING, "Reading...")
                         self._start_thinking_sound()
 
-                        final_resp = OLLAMA_CLIENT.chat(model=TEXT_MODEL, messages=summary_prompt, stream=False, options=OLLAMA_OPTIONS)
-                        final_text = self._extract_ollama_content(final_resp)
+                        final_resp = OLLAMA_CLIENT.chat(
+                            model=TEXT_MODEL,
+                            messages=summary_prompt,
+                            stream=False,
+                            options=OLLAMA_FACTUAL_OPTIONS,
+                        )
+                        final_text = self._strip_speaker_prefix(
+                            self._extract_ollama_content(final_resp).encode('ascii', 'ignore').decode('ascii')
+                        ).strip()
+                        if not final_text:
+                            final_text = "I searched online, but could not find the exact answer."
 
                         self.thinking_sound_active.clear()
                         self.set_state(BotStates.SPEAKING, "Speaking...")
@@ -3257,41 +3534,50 @@ class BotGUI:
 
     def load_chat_history(self):
         if not bool(CURRENT_CONFIG.get("chat_memory", True)):
-            return [{"role": "system", "content": SYSTEM_PROMPT}]
+            return []
+        max_msgs = max(2, int(CURRENT_CONFIG.get("max_history_turns", 6)) * 2)
         if os.path.exists(MEMORY_FILE):
             try:
                 with open(MEMORY_FILE, "r") as f:
                     history = json.load(f)
-                    if history and len(history) > 0:
-                        cleaned = [
-                            m for m in history[1:]
-                            if isinstance(m, dict) and str(m.get("content", "")).strip() != ""
-                        ]
-                        prev_a = None
-                        for m in cleaned:
-                            if m.get("role") == "assistant":
-                                cur_a = self._norm_text(m.get("content", ""))
-                                if cur_a and cur_a == prev_a:
-                                    print("[MEM] Cleared repetitive history from memory.json.", flush=True)
-                                    return [{"role": "system", "content": SYSTEM_PROMPT}]
-                                prev_a = cur_a
-                        return [{"role": "system", "content": SYSTEM_PROMPT}] + cleaned
+                if isinstance(history, list):
+                    cleaned = []
+                    for m in history:
+                        if not isinstance(m, dict):
+                            continue
+                        role = str(m.get("role", "")).strip()
+                        content = str(m.get("content", "")).strip()
+                        if role not in ("user", "assistant") or not content:
+                            continue
+                        if role == "assistant" and ("### EXAMPLES ###" in content or "Normal Text:" in content):
+                            continue
+                        cleaned.append({"role": role, "content": content})
+                    prev_a = None
+                    for m in cleaned:
+                        if m["role"] == "assistant":
+                            cur_a = self._norm_text(m["content"])
+                            if cur_a and cur_a == prev_a:
+                                print("[MEM] Cleared repetitive history from memory.json.", flush=True)
+                                return []
+                            prev_a = cur_a
+                    return cleaned[-max_msgs:]
             except Exception:
                 pass
-        return [{"role": "system", "content": SYSTEM_PROMPT}]
+        return []
 
     def save_chat_history(self):
         if not getattr(self, "chat_memory_enabled", bool(CURRENT_CONFIG.get("chat_memory", True))):
             conv = []
         else:
-            full = self.permanent_memory + self.session_memory
-            conv = full[1:]
-            if len(conv) > 6:
-                conv = conv[-6:]
+            max_msgs = max(2, int(CURRENT_CONFIG.get("max_history_turns", 6)) * 2)
+            conv = [
+                m for m in (self.permanent_memory + self.session_memory)
+                if isinstance(m, dict) and m.get("role") in ("user", "assistant") and str(m.get("content", "")).strip()
+            ][-max_msgs:]
         tmp_path = f"{MEMORY_FILE}.tmp"
         try:
             with open(tmp_path, "w") as f:
-                json.dump([{"role": "system", "content": SYSTEM_PROMPT}] + conv, f, indent=4)
+                json.dump(conv, f, indent=4)
             os.replace(tmp_path, MEMORY_FILE)
         except Exception as e:
             print(f"[MEM ERROR] Save chat history failed: {e}", flush=True)
